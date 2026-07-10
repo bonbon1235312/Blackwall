@@ -1,0 +1,10 @@
+/target
+
+# Secrets — never commit your real token.
+.env
+
+# Local SQLite database (holds per-server config — not something to share).
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
