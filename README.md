@@ -261,7 +261,7 @@ Copy `.env.example` to `.env` and fill in:
 ```
 DISCORD_TOKEN=your-bot-token-from-above
 TEST_GUILD_ID=your-test-server-id
-DATABASE_PATH=
+DATABASE_URL=
 DISCORD_CLIENT_SECRET=
 PUBLIC_BASE_URL=
 WEB_BIND_ADDR=
@@ -273,9 +273,16 @@ SUPPORT_SERVER_INVITE_URL=
 up in your test server within seconds. Without it, Discord can take up to
 an hour to roll a new global command out everywhere.
 
-`DATABASE_PATH` is optional — leave it blank to use `blackwall.db` in the
-project folder (created automatically). Only set it if you want the
-database file somewhere else.
+`DATABASE_URL` is **required**: Supabase's *direct* Postgres connection
+string (Project Settings -> Database -> Connection string -> URI in the
+Supabase dashboard) — not the pooler connection, and not the
+`service_role` key. Blackwall is a single persistent process, not a swarm
+of short-lived serverless functions, so there's nothing for a connection
+pooler to help with, and Supabase's default pooler (PgBouncer in
+transaction mode) doesn't support the prepared statements `sqlx` uses by
+default. Run `blackwallsite/supabase/schema.sql` once in the Supabase SQL
+editor before starting the bot — this is the same database the owner
+dashboard website reads from, so the two always agree.
 
 `DISCORD_CLIENT_SECRET` is optional for the bot overall, but required for
 the verification website. If it is blank, Blackwall logs a warning and
@@ -415,10 +422,13 @@ src/
                         suspicious accounts) that check it.
     nuke.rs               Per-(guild, actor) dangerous audit-log-action
                         history and the burst rule that checks it.
+    evasion.rs             Tracks the most recent ban/kick per guild, so a
+                        suspicious new join shortly after can be flagged
+                        (never auto-blocked) as a possible evasion attempt.
     permissions.rs        Shared permission-risk checks (`@everyone`
-                        Administrator, admin counts, dangerous role IDs)
-                        used by `/setup`, `/security-score`, and the
-                        dashboard.
+                        Administrator, admin counts, dangerous role IDs,
+                        Verification Level) used by `/setup`,
+                        `/security-score`, and the dashboard.
   actions/
     lockdown.rs           Locks/unlocks every text channel, with
                           snapshot/restore of each channel's exact prior
@@ -430,14 +440,22 @@ src/
                         creation timestamp (used by anti-raid).
   storage/
     mod.rs             Just wires the submodules below together.
-    database.rs          Opens the SQLite file and creates tables if they
-                          don't exist yet.
+    database.rs          Connects to the shared Supabase Postgres
+                          database. Doesn't create tables — the schema's
+                          one authoritative source is
+                          `blackwallsite/supabase/schema.sql`, run once by
+                          hand in Supabase's SQL editor, since the same
+                          database is also read by the dashboard website.
     models.rs            The `GuildConfig` / `GuildSettings` types and the
                           queries that read and write them, plus
                           `verified_users` / `security_events` /
-                          `lockdown_snapshots` / `backups` reads and
-                          writes, and the dashboard's
-                          `get_guilds_owned_by` lookup.
+                          `lockdown_snapshots` / `backups` /
+                          `security_scores` reads and writes, and the
+                          dashboard's `get_guilds_owned_by` lookup.
+    cache.rs              `SettingsCache`: an in-memory cache over
+                          `guild_settings` so the message-handling hot
+                          path never makes a network round-trip to
+                          Supabase just to check a few booleans.
   verification/
     sessions.rs          One-time OAuth state tokens for member
                         verification.

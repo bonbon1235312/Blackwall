@@ -1,4 +1,4 @@
-use sqlx::SqlitePool;
+use sqlx::PgPool;
 use twilight_http::Client as HttpClient;
 use twilight_model::id::{
     Id,
@@ -28,7 +28,7 @@ impl From<sqlx::Error> for GrantVerifiedRoleError {
 
 pub async fn grant_verified_role(
     http: &HttpClient,
-    db: &SqlitePool,
+    db: &PgPool,
     guild_id: Id<GuildMarker>,
     user_id: Id<UserMarker>,
 ) -> Result<(), GrantVerifiedRoleError> {

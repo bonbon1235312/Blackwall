@@ -1,4 +1,4 @@
-use sqlx::{Row, SqlitePool};
+use sqlx::{PgPool, Row};
 use twilight_model::guild::Permissions;
 use twilight_model::id::{
     Id,
@@ -21,19 +21,15 @@ pub struct GuildConfig {
 /// Existing feature toggles in `guild_settings` are never touched by this:
 /// it only fills them in the first time, so changing a channel or role in
 /// the setup panel cannot silently undo a setting an admin already changed.
-pub async fn upsert_guild_config(
-    pool: &SqlitePool,
-    config: &GuildConfig,
-) -> Result<(), sqlx::Error> {
+pub async fn upsert_guild_config(pool: &PgPool, config: &GuildConfig) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO guilds (guild_id, owner_id, log_channel_id, verified_role_id, quarantine_role_id)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(guild_id) DO UPDATE SET
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (guild_id) DO UPDATE SET
             owner_id = excluded.owner_id,
             log_channel_id = excluded.log_channel_id,
             verified_role_id = excluded.verified_role_id,
-            quarantine_role_id = excluded.quarantine_role_id,
-            updated_at = CURRENT_TIMESTAMP",
+            quarantine_role_id = excluded.quarantine_role_id",
     )
     .bind(config.guild_id.to_string())
     .bind(config.owner_id.to_string())
@@ -43,19 +39,21 @@ pub async fn upsert_guild_config(
     .execute(pool)
     .await?;
 
-    sqlx::query("INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)")
-        .bind(config.guild_id.to_string())
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO guild_settings (guild_id) VALUES ($1) ON CONFLICT (guild_id) DO NOTHING",
+    )
+    .bind(config.guild_id.to_string())
+    .execute(pool)
+    .await?;
 
     Ok(())
 }
 
 /// Looks up a guild's saved setup choices, if it has been initialized.
-pub async fn get_guild_config(pool: &SqlitePool, guild_id: Id<GuildMarker>) -> Option<GuildConfig> {
+pub async fn get_guild_config(pool: &PgPool, guild_id: Id<GuildMarker>) -> Option<GuildConfig> {
     let row = sqlx::query(
         "SELECT owner_id, log_channel_id, verified_role_id, quarantine_role_id
-         FROM guilds WHERE guild_id = ?",
+         FROM guilds WHERE guild_id = $1",
     )
     .bind(guild_id.to_string())
     .fetch_optional(pool)
@@ -97,51 +95,45 @@ pub async fn get_guild_config(pool: &SqlitePool, guild_id: Id<GuildMarker>) -> O
 
 /// Updates the log channel selected in the setup panel.
 pub async fn set_log_channel_id(
-    pool: &SqlitePool,
+    pool: &PgPool,
     guild_id: Id<GuildMarker>,
     channel_id: Id<ChannelMarker>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "UPDATE guilds SET log_channel_id = ?, updated_at = CURRENT_TIMESTAMP WHERE guild_id = ?",
-    )
-    .bind(channel_id.to_string())
-    .bind(guild_id.to_string())
-    .execute(pool)
-    .await?;
+    sqlx::query("UPDATE guilds SET log_channel_id = $1 WHERE guild_id = $2")
+        .bind(channel_id.to_string())
+        .bind(guild_id.to_string())
+        .execute(pool)
+        .await?;
 
     Ok(())
 }
 
 /// Updates the role granted after a successful OAuth verification.
 pub async fn set_verified_role_id(
-    pool: &SqlitePool,
+    pool: &PgPool,
     guild_id: Id<GuildMarker>,
     role_id: Id<RoleMarker>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "UPDATE guilds SET verified_role_id = ?, updated_at = CURRENT_TIMESTAMP WHERE guild_id = ?",
-    )
-    .bind(role_id.to_string())
-    .bind(guild_id.to_string())
-    .execute(pool)
-    .await?;
+    sqlx::query("UPDATE guilds SET verified_role_id = $1 WHERE guild_id = $2")
+        .bind(role_id.to_string())
+        .bind(guild_id.to_string())
+        .execute(pool)
+        .await?;
 
     Ok(())
 }
 
 /// Updates the role used to quarantine suspicious members.
 pub async fn set_quarantine_role_id(
-    pool: &SqlitePool,
+    pool: &PgPool,
     guild_id: Id<GuildMarker>,
     role_id: Id<RoleMarker>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "UPDATE guilds SET quarantine_role_id = ?, updated_at = CURRENT_TIMESTAMP WHERE guild_id = ?",
-    )
-    .bind(role_id.to_string())
-    .bind(guild_id.to_string())
-    .execute(pool)
-    .await?;
+    sqlx::query("UPDATE guilds SET quarantine_role_id = $1 WHERE guild_id = $2")
+        .bind(role_id.to_string())
+        .bind(guild_id.to_string())
+        .execute(pool)
+        .await?;
 
     Ok(())
 }
@@ -150,6 +142,10 @@ pub async fn set_quarantine_role_id(
 /// table. Only the fields something actually reads are included here —
 /// the rest of the columns get their own field once the feature that uses
 /// them exists (verification).
+///
+/// `Clone` is needed by `storage::cache::SettingsCache`, which hands back
+/// an owned copy from its in-memory cache rather than a reference.
+#[derive(Clone)]
 pub struct GuildSettings {
     pub anti_spam_enabled: bool,
     pub anti_scam_enabled: bool,
@@ -165,12 +161,17 @@ pub struct GuildSettings {
 /// "on" in that case, matching the smart defaults `/setup` itself would
 /// have saved. `support_join` is the one exception: it's opt-in, so a
 /// missing row (or a row that's never had it explicitly turned on) means
-/// "off," matching the column's own `DEFAULT 0`.
-pub async fn get_guild_settings(pool: &SqlitePool, guild_id: Id<GuildMarker>) -> GuildSettings {
+/// "off," matching the column's own `DEFAULT false`.
+///
+/// This runs on every message, join, and audit-log entry, so callers
+/// should almost always go through `storage::cache::SettingsCache`
+/// instead of calling this directly — it's still here as the thing the
+/// cache falls back to on a miss.
+pub async fn get_guild_settings(pool: &PgPool, guild_id: Id<GuildMarker>) -> GuildSettings {
     let row = sqlx::query(
         "SELECT anti_spam_enabled, anti_scam_enabled, anti_raid_enabled, anti_nuke_enabled,
                 support_join_enabled
-         FROM guild_settings WHERE guild_id = ?",
+         FROM guild_settings WHERE guild_id = $1",
     )
     .bind(guild_id.to_string())
     .fetch_optional(pool)
@@ -210,13 +211,16 @@ pub async fn get_guild_settings(pool: &SqlitePool, guild_id: Id<GuildMarker>) ->
 ///
 /// Called from `/setup`'s optional `support_server_join` option. Assumes
 /// the `guild_settings` row already exists (guaranteed by
-/// `upsert_guild_config`, which always runs first in `/setup`).
+/// `upsert_guild_config`, which always runs first in `/setup`). Callers
+/// must invalidate the settings cache after this succeeds — this
+/// function only touches the database, not the cache, since `models.rs`
+/// doesn't have access to `AppState`.
 pub async fn set_support_join_enabled(
-    pool: &SqlitePool,
+    pool: &PgPool,
     guild_id: Id<GuildMarker>,
     enabled: bool,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE guild_settings SET support_join_enabled = ? WHERE guild_id = ?")
+    sqlx::query("UPDATE guild_settings SET support_join_enabled = $1 WHERE guild_id = $2")
         .bind(enabled)
         .bind(guild_id.to_string())
         .execute(pool)
@@ -226,14 +230,11 @@ pub async fn set_support_join_enabled(
 }
 
 /// Looks up where a guild's moderation logs should be sent, if configured.
-///
-/// This runs on every message a moderation filter acts on, so it stays a
-/// single, simple lookup rather than something heavier.
 pub async fn get_log_channel_id(
-    pool: &SqlitePool,
+    pool: &PgPool,
     guild_id: Id<GuildMarker>,
 ) -> Option<Id<ChannelMarker>> {
-    let row = sqlx::query("SELECT log_channel_id FROM guilds WHERE guild_id = ?")
+    let row = sqlx::query("SELECT log_channel_id FROM guilds WHERE guild_id = $1")
         .bind(guild_id.to_string())
         .fetch_optional(pool)
         .await
@@ -261,8 +262,8 @@ pub async fn get_log_channel_id(
 /// should treat "unknown owner" the same as "not the owner" and still
 /// attempt the action, since skipping it on a guess would be wrong too
 /// often to be worth it.
-pub async fn get_owner_id(pool: &SqlitePool, guild_id: Id<GuildMarker>) -> Option<Id<UserMarker>> {
-    let row = sqlx::query("SELECT owner_id FROM guilds WHERE guild_id = ?")
+pub async fn get_owner_id(pool: &PgPool, guild_id: Id<GuildMarker>) -> Option<Id<UserMarker>> {
+    let row = sqlx::query("SELECT owner_id FROM guilds WHERE guild_id = $1")
         .bind(guild_id.to_string())
         .fetch_optional(pool)
         .await
@@ -284,11 +285,8 @@ pub async fn get_owner_id(pool: &SqlitePool, guild_id: Id<GuildMarker>) -> Optio
 /// Discord which servers the logged-in user is in: it's already recorded
 /// here, and avoids needing the `guilds` OAuth scope at all for the
 /// dashboard login (see `verification::oauth::dashboard_authorize_url`).
-pub async fn get_guilds_owned_by(
-    pool: &SqlitePool,
-    user_id: Id<UserMarker>,
-) -> Vec<Id<GuildMarker>> {
-    let rows = sqlx::query("SELECT guild_id FROM guilds WHERE owner_id = ?")
+pub async fn get_guilds_owned_by(pool: &PgPool, user_id: Id<UserMarker>) -> Vec<Id<GuildMarker>> {
+    let rows = sqlx::query("SELECT guild_id FROM guilds WHERE owner_id = $1")
         .bind(user_id.to_string())
         .fetch_all(pool)
         .await
@@ -307,10 +305,10 @@ pub async fn get_guilds_owned_by(
 
 /// Looks up the role configured by `/setup` for successful verification.
 pub async fn get_verified_role_id(
-    pool: &SqlitePool,
+    pool: &PgPool,
     guild_id: Id<GuildMarker>,
 ) -> Result<Option<Id<RoleMarker>>, sqlx::Error> {
-    let Some(row) = sqlx::query("SELECT verified_role_id FROM guilds WHERE guild_id = ?")
+    let Some(row) = sqlx::query("SELECT verified_role_id FROM guilds WHERE guild_id = $1")
         .bind(guild_id.to_string())
         .fetch_optional(pool)
         .await?
@@ -329,10 +327,10 @@ pub async fn get_verified_role_id(
 /// Looks up the role configured by `/setup` for quarantining suspicious
 /// or nuke-detected members.
 pub async fn get_quarantine_role_id(
-    pool: &SqlitePool,
+    pool: &PgPool,
     guild_id: Id<GuildMarker>,
 ) -> Option<Id<RoleMarker>> {
-    let row = sqlx::query("SELECT quarantine_role_id FROM guilds WHERE guild_id = ?")
+    let row = sqlx::query("SELECT quarantine_role_id FROM guilds WHERE guild_id = $1")
         .bind(guild_id.to_string())
         .fetch_optional(pool)
         .await
@@ -350,14 +348,16 @@ pub async fn get_quarantine_role_id(
 
 /// Records that a user successfully completed verification for a guild.
 pub async fn record_verification(
-    pool: &SqlitePool,
+    pool: &PgPool,
     guild_id: Id<GuildMarker>,
     user_id: Id<UserMarker>,
     method: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT OR REPLACE INTO verified_users (guild_id, user_id, method)
-         VALUES (?, ?, ?)",
+        "INSERT INTO verified_users (guild_id, user_id, method) VALUES ($1, $2, $3)
+         ON CONFLICT (guild_id, user_id) DO UPDATE SET
+            method = excluded.method,
+            verified_at = now()",
     )
     .bind(guild_id.to_string())
     .bind(user_id.to_string())
@@ -370,7 +370,7 @@ pub async fn record_verification(
 
 /// Records a moderation/security event for later dashboard and audit views.
 pub async fn record_security_event(
-    pool: &SqlitePool,
+    pool: &PgPool,
     guild_id: Id<GuildMarker>,
     user_id: Option<Id<UserMarker>>,
     event_type: &str,
@@ -379,7 +379,7 @@ pub async fn record_security_event(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO security_events (guild_id, user_id, event_type, severity, description)
-         VALUES (?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(guild_id.to_string())
     .bind(user_id.map(|id| id.to_string()))
@@ -403,13 +403,14 @@ pub struct SecurityEvent {
 /// The most recent security events for a guild, newest first — the
 /// dashboard's "recent incidents" list.
 pub async fn get_recent_security_events(
-    pool: &SqlitePool,
+    pool: &PgPool,
     guild_id: Id<GuildMarker>,
     limit: i64,
 ) -> Vec<SecurityEvent> {
     let rows = sqlx::query(
-        "SELECT event_type, severity, description, created_at FROM security_events
-         WHERE guild_id = ? ORDER BY id DESC LIMIT ?",
+        "SELECT event_type, severity, description, created_at::text AS created_at
+         FROM security_events
+         WHERE guild_id = $1 ORDER BY id DESC LIMIT $2",
     )
     .bind(guild_id.to_string())
     .bind(limit)
@@ -452,7 +453,7 @@ pub struct LockdownSnapshot {
 /// `existing` is `None` if the channel had no `@everyone` overwrite
 /// before lockdown started.
 pub async fn save_lockdown_snapshot(
-    pool: &SqlitePool,
+    pool: &PgPool,
     guild_id: Id<GuildMarker>,
     channel_id: Id<ChannelMarker>,
     existing: Option<(Permissions, Permissions)>,
@@ -463,9 +464,9 @@ pub async fn save_lockdown_snapshot(
     };
 
     sqlx::query(
-        "INSERT OR REPLACE INTO lockdown_snapshots
+        "INSERT INTO lockdown_snapshots
             (guild_id, channel_id, had_overwrite, everyone_allow, everyone_deny)
-         VALUES (?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(guild_id.to_string())
     .bind(channel_id.to_string())
@@ -482,19 +483,19 @@ pub async fn save_lockdown_snapshot(
 /// "restore everything, then forget it" step. Calling it again on a guild
 /// that isn't locked down just returns an empty list.
 pub async fn take_lockdown_snapshots(
-    pool: &SqlitePool,
+    pool: &PgPool,
     guild_id: Id<GuildMarker>,
 ) -> Vec<LockdownSnapshot> {
     let rows = sqlx::query(
         "SELECT channel_id, had_overwrite, everyone_allow, everyone_deny
-         FROM lockdown_snapshots WHERE guild_id = ?",
+         FROM lockdown_snapshots WHERE guild_id = $1",
     )
     .bind(guild_id.to_string())
     .fetch_all(pool)
     .await
     .expect("failed to read lockdown snapshots");
 
-    sqlx::query("DELETE FROM lockdown_snapshots WHERE guild_id = ?")
+    sqlx::query("DELETE FROM lockdown_snapshots WHERE guild_id = $1")
         .bind(guild_id.to_string())
         .execute(pool)
         .await
@@ -527,23 +528,11 @@ pub async fn take_lockdown_snapshots(
         .collect()
 }
 
-/// Sets `guilds.lockdown_enabled`. A no-op (affects zero rows) if the
-/// guild hasn't run `/setup` yet — the lockdown itself (the channel
-/// overwrites) still applies regardless; this flag is just for display.
-pub async fn set_lockdown_enabled(pool: &SqlitePool, guild_id: Id<GuildMarker>, enabled: bool) {
-    sqlx::query("UPDATE guilds SET lockdown_enabled = ? WHERE guild_id = ?")
-        .bind(enabled)
-        .bind(guild_id.to_string())
-        .execute(pool)
-        .await
-        .expect("failed to update lockdown_enabled");
-}
-
 /// Saves a `/backup` snapshot. `backup_json` is a serialized
 /// `discord::backup::GuildBackup` — storage doesn't know or care about its
 /// shape, just that it's a string to keep and hand back later.
-pub async fn create_backup(pool: &SqlitePool, guild_id: Id<GuildMarker>, backup_json: &str) {
-    sqlx::query("INSERT INTO backups (guild_id, backup_json) VALUES (?, ?)")
+pub async fn create_backup(pool: &PgPool, guild_id: Id<GuildMarker>, backup_json: &str) {
+    sqlx::query("INSERT INTO backups (guild_id, backup_json) VALUES ($1, $2::jsonb)")
         .bind(guild_id.to_string())
         .bind(backup_json)
         .execute(pool)
@@ -555,19 +544,55 @@ pub async fn create_backup(pool: &SqlitePool, guild_id: Id<GuildMarker>, backup_
 /// exists. `/restore` only ever restores from the latest snapshot for
 /// now — picking among older ones is a reasonable future addition, not
 /// needed for a first version.
-pub async fn get_latest_backup_json(
-    pool: &SqlitePool,
-    guild_id: Id<GuildMarker>,
-) -> Option<String> {
-    let row =
-        sqlx::query("SELECT backup_json FROM backups WHERE guild_id = ? ORDER BY id DESC LIMIT 1")
-            .bind(guild_id.to_string())
-            .fetch_optional(pool)
-            .await
-            .expect("failed to look up the latest backup")?;
+pub async fn get_latest_backup_json(pool: &PgPool, guild_id: Id<GuildMarker>) -> Option<String> {
+    let row = sqlx::query(
+        "SELECT backup_json::text AS backup_json FROM backups
+         WHERE guild_id = $1 ORDER BY id DESC LIMIT 1",
+    )
+    .bind(guild_id.to_string())
+    .fetch_optional(pool)
+    .await
+    .expect("failed to look up the latest backup")?;
 
     Some(
         row.try_get("backup_json")
             .expect("backups.backup_json column missing or the wrong type"),
     )
+}
+
+/// Overwrites a guild's cached security score — called after `/setup` and
+/// `/security-score` recompute `moderation::permissions::PermissionFindings`,
+/// so the owner-dashboard website can show a score without ever calling
+/// Discord's API itself.
+pub async fn upsert_security_score(
+    pool: &PgPool,
+    guild_id: Id<GuildMarker>,
+    score: i64,
+    critical_findings: &[String],
+    medium_findings: &[String],
+) {
+    // Bound as plain text + cast to jsonb in the query, same pattern as
+    // `create_backup` below — avoids needing sqlx's `json` feature just
+    // for this one write.
+    let critical_json =
+        serde_json::to_string(critical_findings).expect("Vec<String> should always serialize");
+    let medium_json =
+        serde_json::to_string(medium_findings).expect("Vec<String> should always serialize");
+
+    sqlx::query(
+        "INSERT INTO security_scores (guild_id, score, critical_findings, medium_findings, computed_at)
+         VALUES ($1, $2, $3::jsonb, $4::jsonb, now())
+         ON CONFLICT (guild_id) DO UPDATE SET
+            score = excluded.score,
+            critical_findings = excluded.critical_findings,
+            medium_findings = excluded.medium_findings,
+            computed_at = excluded.computed_at",
+    )
+    .bind(guild_id.to_string())
+    .bind(score)
+    .bind(critical_json)
+    .bind(medium_json)
+    .execute(pool)
+    .await
+    .expect("failed to save security score");
 }

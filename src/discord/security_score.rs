@@ -9,6 +9,7 @@ use twilight_util::builder::embed::{EmbedBuilder, EmbedFieldBuilder};
 
 use crate::moderation::permissions::{self, PermissionFindings};
 use crate::state::AppState;
+use crate::storage::models;
 
 pub fn command() -> Command {
     CommandBuilder::new(
@@ -113,6 +114,15 @@ pub async fn handle(interaction: &Interaction, state: &AppState) {
             );
         }
     }
+
+    models::upsert_security_score(
+        &state.db,
+        guild_id,
+        findings.score(),
+        &findings.critical,
+        &findings.medium,
+    )
+    .await;
 
     let embed = build_score_embed(&findings);
     respond_with_embed(interaction, state, embed).await;

@@ -19,9 +19,16 @@ pub struct Config {
     /// while developing, remove it (or leave it unset) for production.
     pub test_guild_id: Option<Id<GuildMarker>>,
 
-    /// Path to the SQLite database file. Created automatically if it
-    /// doesn't exist yet.
-    pub database_path: String,
+    /// Postgres connection string for the shared Supabase database (also
+    /// read by the owner-dashboard website). Use Supabase's **direct**
+    /// connection string (Project Settings -> Database -> Connection
+    /// string -> URI), not a pooler one — Blackwall is one persistent
+    /// process holding its own small connection pool, not a swarm of
+    /// short-lived serverless functions, so there's nothing for a pooler
+    /// to help with here. It would actively hurt: PgBouncer's transaction
+    /// pooling mode (Supabase's pooler default) doesn't support the
+    /// prepared statements sqlx uses by default.
+    pub database_url: String,
 
     /// Discord OAuth client secret. If absent, the verification website is
     /// disabled but the Discord bot still runs normally.
@@ -68,8 +75,8 @@ impl Config {
             Id::new(parsed)
         });
 
-        let database_path =
-            non_empty_env("DATABASE_PATH").unwrap_or_else(|| "blackwall.db".to_string());
+        let database_url = env::var("DATABASE_URL")
+            .expect("DATABASE_URL must be set to Supabase's direct Postgres connection string");
 
         let discord_client_secret = non_empty_env("DISCORD_CLIENT_SECRET");
 
@@ -93,7 +100,7 @@ impl Config {
         Config {
             discord_token,
             test_guild_id,
-            database_path,
+            database_url,
             discord_client_secret,
             public_base_url,
             web_bind_addr,

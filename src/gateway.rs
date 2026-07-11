@@ -95,7 +95,7 @@ async fn handle_event(event: Event, state: Arc<AppState>) {
                 return;
             };
 
-            let settings = models::get_guild_settings(&state.db, guild_id).await;
+            let settings = state.settings_cache.get(&state.db, guild_id).await;
 
             if settings.anti_scam_enabled
                 && let Some(scam_match) = scam::check(&state.scam_matcher, &message.content)
@@ -121,7 +121,7 @@ async fn handle_event(event: Event, state: Arc<AppState>) {
         Event::MemberAdd(member_add) => {
             let guild_id = member_add.guild_id;
 
-            let settings = models::get_guild_settings(&state.db, guild_id).await;
+            let settings = state.settings_cache.get(&state.db, guild_id).await;
             if !settings.anti_raid_enabled {
                 return;
             }
@@ -163,7 +163,7 @@ async fn handle_event(event: Event, state: Arc<AppState>) {
                 state.evasion_tracker.mark_removal(guild_id);
             }
 
-            let settings = models::get_guild_settings(&state.db, guild_id).await;
+            let settings = state.settings_cache.get(&state.db, guild_id).await;
             if !settings.anti_nuke_enabled {
                 return;
             }

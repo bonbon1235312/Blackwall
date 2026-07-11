@@ -70,9 +70,22 @@ conversation that produced it. Read in this order:
    design (no `guilds` OAuth scope needed), and exactly what has and
    hasn't been live-tested yet.
 
+9. **[08_SUPABASE_MIGRATION.md](08_SUPABASE_MIGRATION.md)** — the move
+   from a local SQLite file to a shared Supabase Postgres database (the
+   same one `blackwallsite`, the Vercel-hosted marketing site + live
+   owner dashboard, reads from). Covers every query's rewrite to
+   Postgres dialect, the new `storage::cache::SettingsCache` (so the
+   message-handling hot path never hits the network for a handful of
+   booleans), the `security_scores` table both `/setup` and
+   `/security-score` now write to, two genuinely-dead columns removed
+   rather than carried forward, why the bot needs a *different*
+   credential (a direct Postgres connection string) than the website
+   does (the `service_role` key), and what's confirmed working versus
+   still untested against a live bot connection.
+
 ## If you're an AI resuming this project
 
-Read all eight documents fully before writing any code. Then:
+Read all nine documents fully before writing any code. Then:
 
 - Check `Cargo.toml`/`Cargo.lock` and the actual `src/` tree against
   `02_PROGRESS_LOG.md`'s "current file inventory" and the completion notes

@@ -41,7 +41,7 @@ async fn main() {
         .timeout(Duration::from_secs(10))
         .build()
         .expect("failed to build OAuth HTTP client");
-    let db = storage::database::connect(&config.database_path).await;
+    let db = storage::database::connect(&config.database_url).await;
 
     let application_id = discord::commands::fetch_application_id(&http)
         .await
@@ -60,6 +60,7 @@ async fn main() {
         join_tracker: moderation::raid::JoinTracker::new(),
         nuke_tracker: moderation::nuke::NukeTracker::new(),
         evasion_tracker: moderation::evasion::EvasionTracker::new(),
+        settings_cache: storage::cache::SettingsCache::new(),
         oauth_client,
         sessions: verification::sessions::SessionStore::default(),
         dashboard_sessions: verification::dashboard::DashboardSessionStore::default(),

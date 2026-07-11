@@ -308,6 +308,7 @@ async fn toggle_support_join(
 
     match models::set_support_join_enabled(&state.db, guild_id, enabled).await {
         Ok(()) => {
+            state.settings_cache.invalidate(guild_id);
             let notice = if enabled {
                 "Support-server join enabled. The verify page will disclose it before asking for consent."
             } else {
@@ -438,9 +439,17 @@ async fn initialize_defaults(
                 .to_string()
         })?;
 
-    Ok(permissions::check(&state.http, guild_id, &guild, &roles)
-        .await
-        .flattened())
+    let findings = permissions::check(&state.http, guild_id, &guild, &roles).await;
+    models::upsert_security_score(
+        &state.db,
+        guild_id,
+        findings.score(),
+        &findings.critical,
+        &findings.medium,
+    )
+    .await;
+
+    Ok(findings.flattened())
 }
 
 async fn collect_quick_check(
@@ -476,9 +485,17 @@ async fn collect_quick_check(
             "Discord returned roles Blackwall could not read.".to_string()
         })?;
 
-    Ok(permissions::check(&state.http, guild_id, &guild, &roles)
-        .await
-        .flattened())
+    let findings = permissions::check(&state.http, guild_id, &guild, &roles).await;
+    models::upsert_security_score(
+        &state.db,
+        guild_id,
+        findings.score(),
+        &findings.critical,
+        &findings.medium,
+    )
+    .await;
+
+    Ok(findings.flattened())
 }
 
 async fn resolve_or_create_role(

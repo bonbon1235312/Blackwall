@@ -1,4 +1,4 @@
-use sqlx::SqlitePool;
+use sqlx::PgPool;
 use twilight_http::Client as HttpClient;
 use twilight_model::channel::ChannelType;
 use twilight_model::guild::Permissions;
@@ -34,7 +34,7 @@ pub struct UnlockdownReport {
 /// instead of being inlined at either call site.
 pub async fn engage(
     http: &HttpClient,
-    db: &SqlitePool,
+    db: &PgPool,
     guild_id: Id<GuildMarker>,
 ) -> Result<LockdownReport, twilight_http::Error> {
     let channels = http
@@ -93,8 +93,6 @@ pub async fn engage(
         }
     }
 
-    models::set_lockdown_enabled(db, guild_id, true).await;
-
     Ok(LockdownReport {
         channels_locked,
         channels_failed,
@@ -105,11 +103,7 @@ pub async fn engage(
 /// [`engage`] snapshotted, then forgets the snapshot. Safe to call on a
 /// guild that isn't currently locked down — it just finds no snapshots
 /// and restores nothing.
-pub async fn revert(
-    http: &HttpClient,
-    db: &SqlitePool,
-    guild_id: Id<GuildMarker>,
-) -> UnlockdownReport {
+pub async fn revert(http: &HttpClient, db: &PgPool, guild_id: Id<GuildMarker>) -> UnlockdownReport {
     let snapshots = models::take_lockdown_snapshots(db, guild_id).await;
     let everyone_role_id: Id<twilight_model::id::marker::RoleMarker> = Id::new(guild_id.get());
 
@@ -147,8 +141,6 @@ pub async fn revert(
             channels_failed += 1;
         }
     }
-
-    models::set_lockdown_enabled(db, guild_id, false).await;
 
     UnlockdownReport {
         channels_restored,

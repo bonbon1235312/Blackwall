@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use aho_corasick::AhoCorasick;
 use reqwest::Client as ReqwestClient;
-use sqlx::SqlitePool;
+use sqlx::PgPool;
 use twilight_http::Client as HttpClient;
 use twilight_model::id::{
     Id,
@@ -13,6 +13,7 @@ use crate::moderation::evasion::EvasionTracker;
 use crate::moderation::nuke::NukeTracker;
 use crate::moderation::raid::JoinTracker;
 use crate::moderation::spam::SpamTracker;
+use crate::storage::cache::SettingsCache;
 use crate::verification::dashboard::DashboardSessionStore;
 use crate::verification::sessions::SessionStore;
 
@@ -33,10 +34,11 @@ pub struct AppState {
     /// away the whole point of using Aho-Corasick.
     pub scam_matcher: AhoCorasick,
 
-    /// Per-guild configuration and settings (see `storage/`). `SqlitePool`
-    /// is already cheap to clone/share internally, so it's stored directly
-    /// rather than behind another `Arc`.
-    pub db: SqlitePool,
+    /// Shared Supabase Postgres pool — also read by the owner-dashboard
+    /// website (see `storage/`). `PgPool` is already cheap to clone/share
+    /// internally, so it's stored directly rather than behind another
+    /// `Arc`.
+    pub db: PgPool,
 
     /// Recent per-user message activity, used to detect spam that spans
     /// multiple messages (bursts, copy-pasted repeats).
@@ -82,4 +84,9 @@ pub struct AppState {
     /// suspicious new join shortly afterward as a possible evasion
     /// attempt.
     pub evasion_tracker: EvasionTracker,
+
+    /// In-memory cache over `guild_settings`, so the message-handling hot
+    /// path (checked on every single message) never makes a network
+    /// round-trip to Supabase. See `storage::cache` for invalidation.
+    pub settings_cache: SettingsCache,
 }
