@@ -190,6 +190,30 @@ matching redirect URI configured in the Discord Developer Portal.
   score and findings as `/security-score`, plus the 10 most recent
   `security_events` rows for that server.
 
+**Beyond the original 10 stages — alt-account detection, without IP addresses:**
+
+An IP-matching alt-account checker was considered and deliberately ruled
+out: public IPs are frequently shared by unrelated people (mobile carrier
+NAT, campus/office networks, VPNs), so a raw IP match is a weak signal
+that would block real, innocent users, and cross-referencing IPs across
+different servers raises real privacy questions on top of that. Two
+zero-new-data-collection alternatives were built instead:
+
+- `/setup` and `/security-score` now flag it (medium severity) when a
+  server's **Verification Level** isn't set to the highest tier — that
+  tier requires a verified phone number to join, which is Discord's own
+  strongest deterrent against throwaway alt accounts, and needs no new
+  data collection on Blackwall's side at all.
+- A new **ban/kick-evasion flag**: Blackwall now watches for
+  `MemberBanAdd`/`MemberKick` audit-log entries (regardless of whether
+  they trip the anti-nuke threshold) and, for 30 minutes afterward, flags
+  any new join that also looks individually suspicious (new account, no
+  avatar — the same heuristic anti-raid already uses). This is a *flag,
+  not a block* — it logs a neutral-colored "Possible ban/kick evasion"
+  embed and says plainly that it's a timing correlation, not proof, since
+  Blackwall has no way to actually link a new Discord account to a
+  removed one without IP or device data.
+
 ## One-time setup
 
 ### 1. Create a Discord application + bot
@@ -334,6 +358,12 @@ You should see log lines like `Blackwall is online`. Try:
   listing every server where you're recorded as the owner (from
   `/setup`). Click through to one to see its security score and recent
   security events.
+- Lower your test server's Verification Level below "Highest" — the next
+  `/setup` or `/security-score` run should flag it as a medium finding.
+- Ban or kick an alt/test account, then have a second alt/test account
+  (with no avatar, or a freshly-created account) join within 30 minutes —
+  you should get a neutral-colored "Possible ban/kick evasion" log embed,
+  with no timeout or block applied to the new joiner.
 
 ## Project layout
 

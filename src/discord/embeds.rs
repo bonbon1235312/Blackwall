@@ -302,6 +302,51 @@ fn suspicion_note(record: &JoinRecord) -> String {
     format!(" — {}", reasons.join(", "))
 }
 
+/// Builds the log embed sent for a possible ban/kick-evasion join — a
+/// single suspicious account joining shortly after a removal, too small
+/// on its own to trip the full raid detector. Uses the neutral color (not
+/// danger) deliberately: this is a flag for staff to look at, not a
+/// confirmed incident Blackwall already acted on.
+pub fn possible_evasion(record: &JoinRecord, seconds_since_removal: u64) -> Embed {
+    EmbedBuilder::new()
+        .title("Possible ban/kick evasion")
+        .color(COLOR_NEUTRAL)
+        .field(EmbedFieldBuilder::new(
+            "Joined",
+            format!(
+                "<@{}> ({}){}",
+                record.user_id,
+                record.username,
+                suspicion_note(record)
+            ),
+        ))
+        .field(EmbedFieldBuilder::new(
+            "Why this was flagged",
+            format!(
+                "A ban or kick happened in this server {}, and this join looked \
+                individually suspicious in that same window. This is a timing \
+                correlation only: Blackwall does not use IP addresses or device \
+                fingerprints, so it cannot confirm this is the same person. No \
+                action was taken automatically.",
+                format_duration_ago(seconds_since_removal)
+            ),
+        ))
+        .build()
+}
+
+/// Renders a seconds count as "3 minute(s) ago" / "1 hour(s) ago" —
+/// precise-to-the-second would read as falsely exact for something
+/// that's already only an approximate correlation.
+fn format_duration_ago(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds} second(s) ago")
+    } else if seconds < 60 * 60 {
+        format!("{} minute(s) ago", seconds / 60)
+    } else {
+        format!("{} hour(s) ago", seconds / (60 * 60))
+    }
+}
+
 /// Builds the log embed sent when a suspected nuke attempt is detected
 /// and responded to.
 pub fn nuke_detected(

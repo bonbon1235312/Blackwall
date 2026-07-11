@@ -3,6 +3,7 @@ use std::sync::Arc;
 use twilight_gateway::{
     Config as GatewayConfig, Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt as _,
 };
+use twilight_model::guild::audit_log::AuditLogEventType;
 use twilight_model::id::Id;
 use twilight_model::id::marker::{GuildMarker, UserMarker};
 
@@ -129,6 +130,17 @@ async fn handle_event(event: Event, state: Arc<AppState>) {
 
             if let Some(violation) = violation {
                 handle_raid_violation(&state, guild_id, &violation, &window).await;
+            } else if let Some(record) = window.last()
+                && record.is_suspicious
+                && let Some(seconds_since_removal) =
+                    state.evasion_tracker.seconds_since_removal(guild_id)
+            {
+                // Deliberately `else if` on the raid branch: a join that's
+                // already part of a full raid response gets a raid embed
+                // with its own timeline — this covers the different case
+                // of a single suspicious rejoin that's too small on its
+                // own to trip the raid thresholds.
+                handle_possible_evasion(&state, guild_id, record, seconds_since_removal).await;
             }
         }
         Event::GuildAuditLogEntryCreate(entry) => {
@@ -138,6 +150,18 @@ async fn handle_event(event: Event, state: Arc<AppState>) {
             let (Some(guild_id), Some(actor_id)) = (entry.guild_id, entry.user_id) else {
                 return;
             };
+
+            // Recorded regardless of the anti-nuke toggle below and
+            // regardless of whether this single ban/kick trips the nuke
+            // threshold — a lone, legitimate staff ban is exactly the
+            // case the evasion tracker cares about, not just nuke-scale
+            // bursts.
+            if matches!(
+                entry.action_type,
+                AuditLogEventType::MemberBanAdd | AuditLogEventType::MemberKick
+            ) {
+                state.evasion_tracker.mark_removal(guild_id);
+            }
 
             let settings = models::get_guild_settings(&state.db, guild_id).await;
             if !settings.anti_nuke_enabled {
@@ -407,6 +431,74 @@ async fn handle_raid_violation(
         .await
     {
         tracing::error!(?source, %guild_id, "failed to send raid log embed");
+    }
+}
+
+/// Flags (never blocks) a single suspicious join that happened shortly
+/// after a ban or kick in this server. This is a timing correlation, not
+/// proof of anything — Blackwall doesn't collect IP addresses or device
+/// fingerprints to actually link the new account to the removed one, so
+/// the log embed says exactly that and leaves the call to staff.
+async fn handle_possible_evasion(
+    state: &AppState,
+    guild_id: Id<GuildMarker>,
+    record: &raid::JoinRecord,
+    seconds_since_removal: u64,
+) {
+    tracing::info!(
+        %guild_id,
+        user_id = %record.user_id,
+        seconds_since_removal,
+        "suspicious join shortly after a ban/kick"
+    );
+
+    let description = format!(
+        "<@{}> ({}) joined {} after a ban or kick in this server, and looked individually \
+        suspicious. This is a timing correlation only, not confirmation it's the same person.",
+        record.user_id,
+        record.username,
+        format_duration_ago(seconds_since_removal)
+    );
+
+    if let Err(source) = models::record_security_event(
+        &state.db,
+        guild_id,
+        Some(record.user_id),
+        "possible_evasion",
+        "medium",
+        &description,
+    )
+    .await
+    {
+        tracing::error!(?source, %guild_id, "failed to record possible-evasion security event");
+    }
+
+    let Some(log_channel_id) = models::get_log_channel_id(&state.db, guild_id).await else {
+        return;
+    };
+
+    let embed = embeds::possible_evasion(record, seconds_since_removal);
+
+    if let Err(source) = state
+        .http
+        .create_message(log_channel_id)
+        .embeds(&[embed])
+        .await
+    {
+        tracing::error!(?source, %guild_id, "failed to send possible-evasion log embed");
+    }
+}
+
+/// Renders a seconds count as "3 minute(s) ago" / "1 hour(s) ago" for the
+/// possible-evasion description — precise-to-the-second would read as
+/// falsely exact for something that's already an approximation.
+fn format_duration_ago(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds} second(s) ago")
+    } else if seconds < 60 * 60 {
+        format!("{} minute(s) ago", seconds / 60)
+    } else {
+        format!("{} hour(s) ago", seconds / (60 * 60))
     }
 }
 

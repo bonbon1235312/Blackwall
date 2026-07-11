@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use twilight_http::Client as HttpClient;
-use twilight_model::guild::{Guild, Permissions, Role};
+use twilight_model::guild::{Guild, Permissions, Role, VerificationLevel};
 use twilight_model::id::{Id, marker::GuildMarker};
 
 /// A handful of cheap, high-signal permission checks — not a full audit,
@@ -56,6 +56,23 @@ pub async fn check(
 ) -> PermissionFindings {
     let mut critical = Vec::new();
     let mut medium = Vec::new();
+
+    // Discord's own strongest deterrent against throwaway alt accounts:
+    // "Highest" verification level requires a verified phone number on
+    // the joining account, which is far scarcer than an email address or
+    // an IP. This is entirely Discord's infrastructure — recommending it
+    // needs no new data collection on Blackwall's side at all, unlike
+    // IP-based or device-fingerprint alt detection (see docs/ for why
+    // that was ruled out).
+    if !matches!(guild.verification_level, VerificationLevel::VeryHigh) {
+        medium.push(
+            "Server verification level isn't set to the highest tier — raising it \
+            (Server Settings -> Safety Setup -> Verification Level -> Highest) requires \
+            a verified phone number to join, which is Discord's own strongest deterrent \
+            against throwaway alt accounts."
+                .to_string(),
+        );
+    }
 
     // The @everyone role's ID is always identical to the guild's ID.
     if let Some(everyone) = roles.iter().find(|role| role.id.get() == guild_id.get()) {

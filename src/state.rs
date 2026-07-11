@@ -9,6 +9,7 @@ use twilight_model::id::{
     marker::{ApplicationMarker, GuildMarker},
 };
 
+use crate::moderation::evasion::EvasionTracker;
 use crate::moderation::nuke::NukeTracker;
 use crate::moderation::raid::JoinTracker;
 use crate::moderation::spam::SpamTracker;
@@ -76,4 +77,9 @@ pub struct AppState {
     /// `sessions` above (see `verification::dashboard`'s own docs for why
     /// the two aren't the same store).
     pub dashboard_sessions: DashboardSessionStore,
+
+    /// Most recent ban/kick per guild, used to flag (never auto-block) a
+    /// suspicious new join shortly afterward as a possible evasion
+    /// attempt.
+    pub evasion_tracker: EvasionTracker,
 }

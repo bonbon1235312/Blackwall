@@ -59,6 +59,7 @@ async fn main() {
         spam_tracker: moderation::spam::SpamTracker::new(),
         join_tracker: moderation::raid::JoinTracker::new(),
         nuke_tracker: moderation::nuke::NukeTracker::new(),
+        evasion_tracker: moderation::evasion::EvasionTracker::new(),
         oauth_client,
         sessions: verification::sessions::SessionStore::default(),
         dashboard_sessions: verification::dashboard::DashboardSessionStore::default(),
