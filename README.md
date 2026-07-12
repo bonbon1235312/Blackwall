@@ -99,19 +99,20 @@ The full OAuth click-through still needs a real browser session with a
 matching redirect URI configured in the Discord Developer Portal.
 
 **Stage 6:**
-- The panel's **Support Join** button turns the feature on or off per
-  server. It starts off and remains unavailable until this Blackwall
-  instance has a `SUPPORT_GUILD_ID` configured.
-- If a server has it on **and** this Blackwall instance has
-  `SUPPORT_GUILD_ID` configured, the verify page requests the extra
-  `guilds.join` OAuth scope and — in plain, visible body text, never
-  fine print — discloses that continuing may add you to Blackwall's
-  official support server. If either condition isn't met, nothing
-  changes: just the `identify` scope, no mention of a support server.
+- The verify page offers joining Blackwall's official support server as
+  the **verifying user's own choice**, not a per-server admin setting —
+  whenever this Blackwall instance has `SUPPORT_GUILD_ID` configured, two
+  buttons appear ("Verify only" and "Verify + join support server"),
+  each requesting a different OAuth scope and creating its own session,
+  so the choice is already decided by the time `/callback` runs. (An
+  earlier version of this made it a per-server admin toggle in `/setup`
+  instead — changed because whether *you* end up in another server
+  isn't really the server owner's call to make for you.)
 - After the primary Verified-role grant succeeds, the support-server add
-  is attempted as a best-effort extra step — its failure never undoes or
-  blocks the verification that already happened. Both outcomes get a log
-  embed and a `security_events` row.
+  is attempted as a best-effort extra step (only if that's what the user
+  chose) — its failure never undoes or blocks the verification that
+  already happened. Both outcomes get a log embed and a `security_events`
+  row.
 - New pages: `/privacy`, `/terms`, `/support` (with a manual join link if
   `SUPPORT_SERVER_INVITE_URL` is set). Every page's footer now links to
   all three.
@@ -297,9 +298,9 @@ Portal.
 web server listens locally.
 
 `SUPPORT_GUILD_ID` is optional. Set it to your own community/support
-server's ID to make the support-server-join feature available at all —
-individual servers still need to opt in with the **Support Join** button
-in their `/setup` panel on top of this.
+server's ID to make the "verify + join support server" choice appear on
+the verify page at all. There's no per-server opt-in on top of this —
+every verifying user across every server decides for themselves.
 
 `SUPPORT_SERVER_INVITE_URL` is optional. A plain `https://discord.gg/...`
 link shown on the `/support` page as a manual fallback. Separate from
@@ -332,11 +333,11 @@ You should see log lines like `Blackwall is online`. Try:
   those should get the message deleted and you timed out for 10 minutes
   (use an alt account or ask a friend to test this one — you probably
   don't want to time yourself out on your main).
-- In `/setup`, turn **Support Join** on (with `SUPPORT_GUILD_ID` configured)
-  and the verify page for that server should now show the
-  support-server-join disclosure and request `identify guilds.join`
-  instead of just `identify`. Visit `/privacy`, `/terms`, and `/support`
-  directly to check the new legal pages render.
+- With `SUPPORT_GUILD_ID` configured, the verify page should show two
+  buttons ("Verify only" and "Verify + join support server") instead of
+  one — the second should request `identify guilds.join` instead of just
+  `identify`. Visit `/privacy`, `/terms`, and `/support` directly to
+  check the new legal pages render.
 - `/lockdown` — should lock every text channel (try sending a message as
   a regular member afterward; it should be blocked) and post a log embed.
   Then `/unlockdown` should restore exactly what it changed.

@@ -57,9 +57,10 @@ pub struct AppState {
     /// Public base URL used to build verification links and OAuth redirects.
     pub public_base_url: String,
 
-    /// The bot's own support/community server. `None` means the
-    /// support-server-join feature is unavailable regardless of any
-    /// per-guild `support_join_enabled` toggle.
+    /// The bot's own support/community server. `None` means the verify
+    /// page never offers joining it — when set, every verifying user
+    /// chooses for themselves (see `web::routes::verify`), there's no
+    /// per-server admin toggle.
     pub support_guild_id: Option<Id<GuildMarker>>,
 
     /// A plain public invite link for the support server, shown to humans

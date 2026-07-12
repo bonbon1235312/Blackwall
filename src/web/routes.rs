@@ -41,28 +41,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-/// Whether a server has both opted into support-server join (`/setup
-/// support_server_join:true`) and this Blackwall instance actually has a
-/// support server configured (`SUPPORT_GUILD_ID`). Both need to be true —
-/// checked here, once, so `/verify` (deciding what to disclose and which
-/// OAuth scope to request) and `/callback` (deciding whether to actually
-/// attempt the join) can never disagree with each other.
-async fn support_join_offered(state: &AppState, guild_id: Id<GuildMarker>) -> bool {
+/// Whether this Blackwall instance has a support server configured at
+/// all (`SUPPORT_GUILD_ID`). This is the *only* gate on whether the
+/// verify page offers the choice at all — there's no per-server admin
+/// toggle anymore. Whether any individual user actually joins it is a
+/// choice made by that user on the verify page itself (see
+/// `verify`/`PendingVerification::wants_support_join`), never something
+/// a server admin decides on their behalf.
+fn support_join_available(state: &AppState) -> bool {
     state.support_guild_id.is_some()
-        && models::get_guild_settings(&state.db, guild_id)
-            .await
-            .support_join_enabled
 }
-
-/// Disclosed on the verify page (in visible body text, not fine print)
-/// whenever a server has opted its members into the support-server-join
-/// feature. Kept as one constant so the Discord-side warning
-/// (`/setup`'s "Support-server join" summary field would be a poor place
-/// for legal-ish copy) and the actual consent page always say the same
-/// thing.
-const SUPPORT_JOIN_DISCLOSURE: &str = "By continuing, you authorise this app to verify your \
-    Discord account. This may also add you to our official support/community server so you can \
-    receive support, updates, and security alerts.";
 
 async fn landing() -> Html<String> {
     Html(templates::landing_page())
@@ -122,20 +110,33 @@ async fn verify(
         }
     };
 
-    let offer_support_join = support_join_offered(&state, guild_id).await;
-
-    let state_token = state.sessions.create(guild_id);
     let redirect_uri = redirect_uri(&state);
-    let oauth_url = oauth::authorize_url(
+
+    // Always build the plain "verify only" session/URL. If this instance
+    // has a support server configured at all, *also* build a second,
+    // independent session/URL that requests the extra `guilds.join`
+    // scope — the verify page renders both as distinct buttons and the
+    // user picks. Each session already knows which choice it represents
+    // by the time `/callback` reads it back, so nothing has to be
+    // re-decided (or looked up from a per-guild admin setting) later.
+    let verify_only_token = state.sessions.create(guild_id, false);
+    let verify_only_url = oauth::authorize_url(
         state.application_id,
         &redirect_uri,
-        &state_token,
-        offer_support_join,
+        &verify_only_token,
+        false,
     );
 
-    let disclosure = offer_support_join.then_some(SUPPORT_JOIN_DISCLOSURE);
+    let verify_and_join_url = support_join_available(&state).then(|| {
+        let token = state.sessions.create(guild_id, true);
+        oauth::authorize_url(state.application_id, &redirect_uri, &token, true)
+    });
 
-    Html(templates::verify_page(&guild_name, &oauth_url, disclosure))
+    Html(templates::verify_page(
+        &guild_name,
+        &verify_only_url,
+        verify_and_join_url.as_deref(),
+    ))
 }
 
 async fn callback(
@@ -263,11 +264,11 @@ async fn callback(
         tracing::warn!(?source, guild_id = %pending.guild_id, user_id = %user.id, "failed to record verification security event");
     }
 
-    // Best-effort, and only attempted at all if the /verify page actually
-    // disclosed and requested `guilds.join` for this session — never
-    // block the primary verification result (already saved above) on
-    // this succeeding or failing.
-    let support_joined = if support_join_offered(&state, pending.guild_id).await {
+    // Best-effort, and only attempted at all if the user chose the
+    // "verify + join support server" button on the verify page for this
+    // specific session — never block the primary verification result
+    // (already saved above) on this succeeding or failing.
+    let support_joined = if pending.wants_support_join {
         Some(attempt_support_join(&state, pending.guild_id, &user, &token.access_token).await)
     } else {
         None
@@ -283,7 +284,8 @@ async fn callback(
 /// Attempts to add a freshly-verified user to the support server using
 /// their OAuth access token (which must include the `guilds.join` scope
 /// for this to succeed — guaranteed by only calling this when
-/// `support_join_offered` was true for the same session). Logs and
+/// `pending.wants_support_join` was true, i.e. the user picked "verify +
+/// join support server" on the verify page for this session). Logs and
 /// records the outcome either way, per the "log support-server join
 /// success/fail" requirement — but the caller treats both outcomes as
 /// "verification still succeeded," since this is a bonus, not the point.

@@ -12,7 +12,7 @@ use crate::moderation::nuke::NukeViolation;
 use crate::moderation::raid::{JoinRecord, RaidViolation};
 use crate::moderation::scam::ScamMatch;
 use crate::moderation::spam::SpamViolation;
-use crate::storage::models::{GuildConfig, GuildSettings};
+use crate::storage::models::GuildConfig;
 use crate::verification::oauth::DiscordUser;
 
 /// Red — used for anything that resulted in a message being removed or a
@@ -98,8 +98,6 @@ pub fn spam_timeout(
 /// Builds the interactive setup panel opened by `/setup`.
 pub fn setup_panel(
     config: Option<&GuildConfig>,
-    settings: &GuildSettings,
-    support_join_available: bool,
     notice: Option<&str>,
     warnings: &[String],
 ) -> Embed {
@@ -108,15 +106,6 @@ pub fn setup_panel(
         "Ready"
     } else {
         "Needs defaults"
-    };
-    let support_join_text = if !support_join_available {
-        "Unavailable on this Blackwall instance."
-    } else if !initialized {
-        "Available after the default setup is created."
-    } else if settings.support_join_enabled {
-        "On - verified members may be offered a support-server join."
-    } else {
-        "Off"
     };
     let warnings_text = if warnings.is_empty() {
         "No quick-check findings shown yet.".to_string()
@@ -175,7 +164,6 @@ pub fn setup_panel(
             )
             .inline(),
         )
-        .field(EmbedFieldBuilder::new("Support-server join", support_join_text).inline())
         .field(EmbedFieldBuilder::new(
             "Active protections",
             "- Anti-scam and anti-spam\n- Anti-raid lockdown\n- Anti-nuke response",

@@ -42,8 +42,10 @@ pub struct Config {
     pub web_bind_addr: String,
 
     /// The bot's own official support/community server. If unset, the
-    /// support-server-join feature is unavailable everywhere, regardless of
-    /// any per-guild `support_join_enabled` toggle.
+    /// verify page never offers the "also join the support server" choice
+    /// at all — when set, every verifying user can choose it for
+    /// themselves (see `web::routes::verify`), there's no per-server admin
+    /// toggle.
     pub support_guild_id: Option<Id<GuildMarker>>,
 
     /// A plain, public Discord invite link (e.g. `https://discord.gg/...`)

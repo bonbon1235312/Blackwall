@@ -9,13 +9,13 @@ use crate::storage::models::{self, GuildSettings};
 /// makes a network round-trip to Supabase just to read a handful of
 /// booleans that almost never change.
 ///
-/// Populated lazily on first read per guild. Invalidated explicitly at
-/// the one place `guild_settings` is actually written outside its
-/// first-time creation: `/setup`'s `support_server_join` option (see
-/// `discord::setup`). A guild's row is created once, with defaults, by
-/// `upsert_guild_config` — that doesn't need an invalidation, since a
-/// freshly-created row's values are exactly what `get_guild_settings`
-/// already falls back to for a missing row.
+/// Populated lazily on first read per guild. Nothing currently writes to
+/// `guild_settings` after its first-time creation by
+/// `upsert_guild_config` (that doesn't need an invalidation either, since
+/// a freshly-created row's values are exactly what `get_guild_settings`
+/// already falls back to for a missing row) — if a future `/config`-style
+/// command adds a way to flip these toggles, that's the point to add an
+/// `invalidate(guild_id)` method back here.
 #[derive(Default)]
 pub struct SettingsCache {
     entries: DashMap<Id<GuildMarker>, GuildSettings>,
@@ -34,9 +34,5 @@ impl SettingsCache {
         let settings = models::get_guild_settings(pool, guild_id).await;
         self.entries.insert(guild_id, settings.clone());
         settings
-    }
-
-    pub fn invalidate(&self, guild_id: Id<GuildMarker>) {
-        self.entries.remove(&guild_id);
     }
 }

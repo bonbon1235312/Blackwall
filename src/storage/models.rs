@@ -151,17 +151,13 @@ pub struct GuildSettings {
     pub anti_scam_enabled: bool,
     pub anti_raid_enabled: bool,
     pub anti_nuke_enabled: bool,
-    pub support_join_enabled: bool,
 }
 
 /// Looks up a guild's feature toggles.
 ///
 /// A guild that hasn't run `/setup` yet has no `guild_settings` row at
-/// all — `anti_spam`/`anti_scam`/`anti_raid`/`anti_nuke` are treated as
-/// "on" in that case, matching the smart defaults `/setup` itself would
-/// have saved. `support_join` is the one exception: it's opt-in, so a
-/// missing row (or a row that's never had it explicitly turned on) means
-/// "off," matching the column's own `DEFAULT false`.
+/// all — every toggle is treated as "on" in that case, matching the
+/// smart defaults `/setup` itself would have saved.
 ///
 /// This runs on every message, join, and audit-log entry, so callers
 /// should almost always go through `storage::cache::SettingsCache`
@@ -169,8 +165,7 @@ pub struct GuildSettings {
 /// cache falls back to on a miss.
 pub async fn get_guild_settings(pool: &PgPool, guild_id: Id<GuildMarker>) -> GuildSettings {
     let row = sqlx::query(
-        "SELECT anti_spam_enabled, anti_scam_enabled, anti_raid_enabled, anti_nuke_enabled,
-                support_join_enabled
+        "SELECT anti_spam_enabled, anti_scam_enabled, anti_raid_enabled, anti_nuke_enabled
          FROM guild_settings WHERE guild_id = $1",
     )
     .bind(guild_id.to_string())
@@ -184,7 +179,6 @@ pub async fn get_guild_settings(pool: &PgPool, guild_id: Id<GuildMarker>) -> Gui
             anti_scam_enabled: true,
             anti_raid_enabled: true,
             anti_nuke_enabled: true,
-            support_join_enabled: false,
         };
     };
 
@@ -201,32 +195,7 @@ pub async fn get_guild_settings(pool: &PgPool, guild_id: Id<GuildMarker>) -> Gui
         anti_nuke_enabled: row
             .try_get("anti_nuke_enabled")
             .expect("guild_settings.anti_nuke_enabled column missing or the wrong type"),
-        support_join_enabled: row
-            .try_get("support_join_enabled")
-            .expect("guild_settings.support_join_enabled column missing or the wrong type"),
     }
-}
-
-/// Turns the per-guild support-server-join opt-in on or off.
-///
-/// Called from `/setup`'s optional `support_server_join` option. Assumes
-/// the `guild_settings` row already exists (guaranteed by
-/// `upsert_guild_config`, which always runs first in `/setup`). Callers
-/// must invalidate the settings cache after this succeeds — this
-/// function only touches the database, not the cache, since `models.rs`
-/// doesn't have access to `AppState`.
-pub async fn set_support_join_enabled(
-    pool: &PgPool,
-    guild_id: Id<GuildMarker>,
-    enabled: bool,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE guild_settings SET support_join_enabled = $1 WHERE guild_id = $2")
-        .bind(enabled)
-        .bind(guild_id.to_string())
-        .execute(pool)
-        .await?;
-
-    Ok(())
 }
 
 /// Looks up where a guild's moderation logs should be sent, if configured.

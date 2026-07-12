@@ -322,18 +322,36 @@ pub fn landing_page() -> String {
 
 pub fn verify_page(
     guild_name: &str,
-    oauth_url: &str,
-    support_join_disclosure: Option<&str>,
+    verify_only_url: &str,
+    verify_and_join_url: Option<&str>,
 ) -> String {
-    let disclosure = support_join_disclosure
-        .map(|text| format!(r#"<p class="notice">{}</p>"#, escape_html(text)))
-        .unwrap_or_default();
-
-    let scope_text = if support_join_disclosure.is_some() {
-        "Your Discord username and user ID, and permission to add you to another server, \
-        through the <code>identify guilds.join</code> OAuth scopes."
-    } else {
-        "Your Discord username and user ID through the <code>identify</code> OAuth scope."
+    // Whether to join Blackwall's official support server is the
+    // verifying *user's* choice, made right here with two distinct
+    // buttons — never a server admin's decision applied to everyone who
+    // verifies. `verify_and_join_url` is `None` on Blackwall instances
+    // that don't have a support server configured at all, in which case
+    // there's nothing to choose between and only the plain button shows.
+    let actions = match verify_and_join_url {
+        Some(join_url) => format!(
+            r#"<div class="actions">
+          <a class="button secondary" href="{verify_only_url}">Verify only</a>
+          <a class="button" href="{join_url}">Verify + join support server</a>
+        </div>
+        <p class="notice">
+          "Verify + join support server" additionally asks Discord's permission to add you to
+          Blackwall's official support/community server, through the extra <code>guilds.join</code>
+          OAuth scope, so you can get help, updates, and security alerts there. Either choice grants
+          this server's Verified role the same way.
+        </p>"#,
+            verify_only_url = escape_html(verify_only_url),
+            join_url = escape_html(join_url),
+        ),
+        None => format!(
+            r#"<div class="actions">
+          <a class="button" href="{verify_only_url}">Continue with Discord</a>
+        </div>"#,
+            verify_only_url = escape_html(verify_only_url),
+        ),
     };
 
     layout(
@@ -347,11 +365,10 @@ pub fn verify_page(
         </div>
         <div class="status">
           <strong>Requested from Discord</strong>
-          <p>{scope_text}</p>
+          <p>Your Discord username and user ID, always through the <code>identify</code> OAuth scope. Choosing to also join the support server below additionally asks for <code>guilds.join</code>.</p>
         </div>
       </div>
       <div class="content">
-        {disclosure}
         <dl class="detail-list">
           <div>
             <dt>Token handling</dt>
@@ -366,13 +383,10 @@ pub fn verify_page(
             <dd>Blackwall stores the server ID, your user ID, verification time, and method.</dd>
           </div>
         </dl>
-        <div class="actions">
-          <a class="button" href="{oauth_url}">Continue with Discord</a>
-        </div>
+        {actions}
       </div>
     </section>"#,
             guild_name = escape_html(guild_name),
-            oauth_url = escape_html(oauth_url),
         ),
     )
 }

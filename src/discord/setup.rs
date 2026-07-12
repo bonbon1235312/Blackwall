@@ -19,14 +19,13 @@ use twilight_util::builder::message::{ActionRowBuilder, ButtonBuilder, SelectMen
 use crate::discord::embeds;
 use crate::moderation::permissions;
 use crate::state::AppState;
-use crate::storage::models::{self, GuildConfig, GuildSettings};
+use crate::storage::models::{self, GuildConfig};
 
 const COMPONENT_PREFIX: &str = "setup:";
 const CREATE_DEFAULTS_ID: &str = "setup:create_defaults";
 const LOG_CHANNEL_SELECT_ID: &str = "setup:log_channel";
 const VERIFIED_ROLE_SELECT_ID: &str = "setup:verified_role";
 const QUARANTINE_ROLE_SELECT_ID: &str = "setup:quarantine_role";
-const SUPPORT_JOIN_TOGGLE_ID: &str = "setup:toggle_support_join";
 const QUICK_CHECK_ID: &str = "setup:quick_check";
 
 struct SetupPanel {
@@ -229,7 +228,6 @@ pub async fn handle_component(
                 }
             }
         }
-        SUPPORT_JOIN_TOGGLE_ID => toggle_support_join(interaction, state, guild_id).await,
         QUICK_CHECK_ID => run_quick_check(interaction, state, guild_id).await,
         _ => {
             tracing::warn!(custom_id = %component.custom_id, "received unknown setup component");
@@ -278,54 +276,6 @@ async fn create_defaults(interaction: &Interaction, state: &AppState, guild_id: 
         }
         Err(message) => {
             update_deferred_panel(interaction, state, guild_id, Some(&message), &[]).await;
-        }
-    }
-}
-
-async fn toggle_support_join(
-    interaction: &Interaction,
-    state: &AppState,
-    guild_id: Id<GuildMarker>,
-) {
-    if state.support_guild_id.is_none() {
-        update_panel(
-            interaction,
-            state,
-            guild_id,
-            Some("Support-server join is not configured for this Blackwall instance."),
-            &[],
-        )
-        .await;
-        return;
-    }
-
-    if !ensure_initialized(interaction, state, guild_id).await {
-        return;
-    }
-
-    let settings = models::get_guild_settings(&state.db, guild_id).await;
-    let enabled = !settings.support_join_enabled;
-
-    match models::set_support_join_enabled(&state.db, guild_id, enabled).await {
-        Ok(()) => {
-            state.settings_cache.invalidate(guild_id);
-            let notice = if enabled {
-                "Support-server join enabled. The verify page will disclose it before asking for consent."
-            } else {
-                "Support-server join disabled."
-            };
-            update_panel(interaction, state, guild_id, Some(notice), &[]).await;
-        }
-        Err(source) => {
-            tracing::error!(?source, %guild_id, "failed to save support-server join setting");
-            update_panel(
-                interaction,
-                state,
-                guild_id,
-                Some("Blackwall could not save the support-server setting. Please try again."),
-                &[],
-            )
-            .await;
         }
     }
 }
@@ -578,26 +528,14 @@ async fn build_panel(
     warnings: &[String],
 ) -> SetupPanel {
     let config = models::get_guild_config(&state.db, guild_id).await;
-    let settings = models::get_guild_settings(&state.db, guild_id).await;
-    let support_join_available = state.support_guild_id.is_some();
 
     SetupPanel {
-        embed: embeds::setup_panel(
-            config.as_ref(),
-            &settings,
-            support_join_available,
-            notice,
-            warnings,
-        ),
-        components: build_components(config.as_ref(), &settings, support_join_available),
+        embed: embeds::setup_panel(config.as_ref(), notice, warnings),
+        components: build_components(config.as_ref()),
     }
 }
 
-fn build_components(
-    config: Option<&GuildConfig>,
-    settings: &GuildSettings,
-    support_join_available: bool,
-) -> Vec<Component> {
+fn build_components(config: Option<&GuildConfig>) -> Vec<Component> {
     let initialized = config.is_some();
 
     let mut log_channel_select =
@@ -643,19 +581,6 @@ fn build_components(
         })
         .disabled(initialized)
         .build();
-    let support_join_button = ButtonBuilder::new(if settings.support_join_enabled {
-        ButtonStyle::Success
-    } else {
-        ButtonStyle::Secondary
-    })
-    .custom_id(SUPPORT_JOIN_TOGGLE_ID)
-    .label(if settings.support_join_enabled {
-        "Support Join: On"
-    } else {
-        "Support Join: Off"
-    })
-    .disabled(!initialized || !support_join_available)
-    .build();
     let quick_check_button = ButtonBuilder::new(ButtonStyle::Secondary)
         .custom_id(QUICK_CHECK_ID)
         .label("Quick Check")
@@ -676,7 +601,6 @@ fn build_components(
             .into(),
         ActionRowBuilder::new()
             .component(defaults_button)
-            .component(support_join_button)
             .component(quick_check_button)
             .build()
             .into(),
@@ -812,16 +736,6 @@ async fn send_response(
 mod tests {
     use super::*;
 
-    fn settings() -> GuildSettings {
-        GuildSettings {
-            anti_spam_enabled: true,
-            anti_scam_enabled: true,
-            anti_raid_enabled: true,
-            anti_nuke_enabled: true,
-            support_join_enabled: false,
-        }
-    }
-
     fn select_is_disabled(components: &[Component], row_index: usize) -> bool {
         let Component::ActionRow(row) = &components[row_index] else {
             panic!("expected an action row");
@@ -835,7 +749,7 @@ mod tests {
 
     #[test]
     fn selectors_wait_for_default_setup() {
-        let components = build_components(None, &settings(), true);
+        let components = build_components(None);
 
         assert_eq!(components.len(), 4);
         assert!(select_is_disabled(&components, 0));
@@ -852,7 +766,7 @@ mod tests {
             verified_role_id: Some(Id::new(4)),
             quarantine_role_id: Some(Id::new(5)),
         };
-        let components = build_components(Some(&config), &settings(), true);
+        let components = build_components(Some(&config));
 
         assert!(!select_is_disabled(&components, 0));
         assert!(!select_is_disabled(&components, 1));
