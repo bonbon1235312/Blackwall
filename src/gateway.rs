@@ -1,11 +1,12 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use twilight_gateway::{
     Config as GatewayConfig, Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt as _,
 };
 use twilight_model::guild::audit_log::AuditLogEventType;
-use twilight_model::id::Id;
 use twilight_model::id::marker::{GuildMarker, UserMarker};
+use twilight_model::id::Id;
 
 use crate::actions::lockdown;
 use crate::discord::{embeds, interactions};
@@ -97,11 +98,11 @@ async fn handle_event(event: Event, state: Arc<AppState>) {
 
             let settings = state.settings_cache.get(&state.db, guild_id).await;
 
-            if settings.anti_scam_enabled
-                && let Some(scam_match) = scam::check(&state.scam_matcher, &message.content)
-            {
-                handle_scam_message(&state, &message, guild_id, &scam_match).await;
-                return;
+            if settings.anti_scam_enabled {
+                if let Some(scam_match) = scam::check(&state.scam_matcher, &message.content) {
+                    handle_scam_message(&state, &message, guild_id, &scam_match).await;
+                    return;
+                }
             }
 
             if settings.anti_spam_enabled {
@@ -126,21 +127,45 @@ async fn handle_event(event: Event, state: Arc<AppState>) {
                 return;
             }
 
-            let (window, violation) = state.join_tracker.record(guild_id, &member_add.member);
+            let detector_started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
+            let raid_check = state.join_tracker.record(guild_id, &member_add.member);
+            if let Some(started) = detector_started {
+                tracing::debug!(
+                    detector_ns = started.elapsed().as_nanos(),
+                    raid_active = raid_check.raid_active,
+                    triggered = raid_check.incident.is_some(),
+                    "anti-raid detector completed"
+                );
+            }
 
-            if let Some(violation) = violation {
-                handle_raid_violation(&state, guild_id, &violation, &window).await;
-            } else if let Some(record) = window.last()
-                && record.is_suspicious
-                && let Some(seconds_since_removal) =
+            if let Some(incident) = raid_check.incident {
+                let lockdown_started =
+                    handle_raid_violation(&state, guild_id, &incident.violation, &incident.window)
+                        .await;
+                if !lockdown_started {
+                    state.join_tracker.schedule_incident_retry(guild_id);
+                }
+            } else if raid_check.raid_active {
+                if raid_check.latest.is_suspicious {
+                    handle_active_raid_join(&state, guild_id, &raid_check.latest).await;
+                }
+            } else if raid_check.latest.is_suspicious {
+                if let Some(seconds_since_removal) =
                     state.evasion_tracker.seconds_since_removal(guild_id)
-            {
-                // Deliberately `else if` on the raid branch: a join that's
-                // already part of a full raid response gets a raid embed
-                // with its own timeline — this covers the different case
-                // of a single suspicious rejoin that's too small on its
-                // own to trip the raid thresholds.
-                handle_possible_evasion(&state, guild_id, record, seconds_since_removal).await;
+                {
+                    // Deliberately `else if` on the raid branch: a join that's
+                    // already part of a full raid response gets a raid embed
+                    // with its own timeline — this covers the different case
+                    // of a single suspicious rejoin that's too small on its
+                    // own to trip the raid thresholds.
+                    handle_possible_evasion(
+                        &state,
+                        guild_id,
+                        &raid_check.latest,
+                        seconds_since_removal,
+                    )
+                    .await;
+                }
             }
         }
         Event::GuildAuditLogEntryCreate(entry) => {
@@ -350,7 +375,7 @@ async fn handle_raid_violation(
     guild_id: Id<GuildMarker>,
     violation: &RaidViolation,
     window: &[raid::JoinRecord],
-) {
+) -> bool {
     tracing::warn!(
         %guild_id,
         reason = %violation.description(),
@@ -364,6 +389,7 @@ async fn handle_raid_violation(
             None
         }
     };
+    let lockdown_started = lockdown_report.is_some();
 
     // Only the individually-suspicious joiners get timed out — the burst
     // threshold alone can trip on a legitimate growth spurt for a small
@@ -373,26 +399,8 @@ async fn handle_raid_violation(
     let mut timed_out_count = 0;
 
     for record in window.iter().filter(|record| record.is_suspicious) {
-        // Same owner-immunity check as anti-spam: Discord never allows
-        // moderating the guild owner, regardless of permissions.
-        if owner_id == Some(record.user_id) {
-            continue;
-        }
-
-        match state
-            .http
-            .update_guild_member(guild_id, record.user_id)
-            .communication_disabled_until(Some(raid::raid_timeout_until()))
-            .await
-        {
-            Ok(_) => timed_out_count += 1,
-            Err(source) => {
-                tracing::error!(
-                    ?source,
-                    user_id = %record.user_id,
-                    "failed to time out suspicious joiner"
-                );
-            }
+        if timeout_raid_joiner(state, guild_id, record, owner_id).await {
+            timed_out_count += 1;
         }
     }
 
@@ -419,7 +427,7 @@ async fn handle_raid_violation(
     }
 
     let Some(log_channel_id) = models::get_log_channel_id(&state.db, guild_id).await else {
-        return;
+        return lockdown_started;
     };
 
     let embed = embeds::raid_detected(violation, window, timed_out_count);
@@ -431,6 +439,57 @@ async fn handle_raid_violation(
         .await
     {
         tracing::error!(?source, %guild_id, "failed to send raid log embed");
+    }
+
+    lockdown_started
+}
+
+/// Applies the raid timeout to a suspicious account that joined after the
+/// current raid incident was already raised. This keeps containment active
+/// without repeating the full lockdown, database event, and staff embed.
+async fn handle_active_raid_join(
+    state: &AppState,
+    guild_id: Id<GuildMarker>,
+    record: &raid::JoinRecord,
+) {
+    let owner_id = models::get_owner_id(&state.db, guild_id).await;
+    if timeout_raid_joiner(state, guild_id, record, owner_id).await {
+        tracing::info!(
+            %guild_id,
+            user_id = %record.user_id,
+            "timed out suspicious joiner during active raid"
+        );
+    }
+}
+
+async fn timeout_raid_joiner(
+    state: &AppState,
+    guild_id: Id<GuildMarker>,
+    record: &raid::JoinRecord,
+    owner_id: Option<Id<UserMarker>>,
+) -> bool {
+    // Same owner-immunity check as anti-spam: Discord never allows
+    // moderating the guild owner, regardless of permissions.
+    if owner_id == Some(record.user_id) {
+        return false;
+    }
+
+    match state
+        .http
+        .update_guild_member(guild_id, record.user_id)
+        .communication_disabled_until(Some(raid::raid_timeout_until()))
+        .await
+    {
+        Ok(_) => true,
+        Err(source) => {
+            tracing::error!(
+                ?source,
+                %guild_id,
+                user_id = %record.user_id,
+                "failed to time out suspicious joiner"
+            );
+            false
+        }
     }
 }
 
@@ -538,23 +597,23 @@ async fn handle_nuke_violation(
 
     let mut roles_removed = 0;
 
-    if let Ok(roles_response) = state.http.roles(guild_id).await
-        && let Ok(roles) = roles_response.model().await
-    {
-        let dangerous_ids = permissions::dangerous_role_ids(&roles);
+    if let Ok(roles_response) = state.http.roles(guild_id).await {
+        if let Ok(roles) = roles_response.model().await {
+            let dangerous_ids = permissions::dangerous_role_ids(&roles);
 
-        if let Ok(member_response) = state.http.guild_member(guild_id, actor_id).await
-            && let Ok(member) = member_response.model().await
-        {
-            for role_id in member.roles.iter().filter(|id| dangerous_ids.contains(id)) {
-                match state
-                    .http
-                    .remove_guild_member_role(guild_id, actor_id, *role_id)
-                    .await
-                {
-                    Ok(_) => roles_removed += 1,
-                    Err(source) => {
-                        tracing::error!(?source, %guild_id, %actor_id, %role_id, "failed to strip dangerous role from nuke actor");
+            if let Ok(member_response) = state.http.guild_member(guild_id, actor_id).await {
+                if let Ok(member) = member_response.model().await {
+                    for role_id in member.roles.iter().filter(|id| dangerous_ids.contains(id)) {
+                        match state
+                            .http
+                            .remove_guild_member_role(guild_id, actor_id, *role_id)
+                            .await
+                        {
+                            Ok(_) => roles_removed += 1,
+                            Err(source) => {
+                                tracing::error!(?source, %guild_id, %actor_id, %role_id, "failed to strip dangerous role from nuke actor");
+                            }
+                        }
                     }
                 }
             }
@@ -609,15 +668,17 @@ async fn handle_nuke_violation(
             Check the server's audit log to confirm what was affected."
         );
 
-        if let Ok(dm_channel) = state.http.create_private_channel(owner_id).await
-            && let Ok(dm_channel) = dm_channel.model().await
-            && let Err(source) = state
-                .http
-                .create_message(dm_channel.id)
-                .content(&dm_content)
-                .await
-        {
-            tracing::error!(?source, %guild_id, %owner_id, "failed to DM owner about nuke attempt");
+        if let Ok(dm_channel_response) = state.http.create_private_channel(owner_id).await {
+            if let Ok(dm_channel) = dm_channel_response.model().await {
+                if let Err(source) = state
+                    .http
+                    .create_message(dm_channel.id)
+                    .content(&dm_content)
+                    .await
+                {
+                    tracing::error!(?source, %guild_id, %owner_id, "failed to DM owner about nuke attempt");
+                }
+            }
         }
     }
 

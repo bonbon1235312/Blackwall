@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use twilight_http::Client as HttpClient;
 use twilight_model::guild::{Guild, Permissions, Role, VerificationLevel};
-use twilight_model::id::{Id, marker::GuildMarker};
+use twilight_model::id::{marker::GuildMarker, Id};
 
 /// A handful of cheap, high-signal permission checks — not a full audit,
 /// just the kind of thing worth surfacing immediately. Shared by `/setup`
@@ -96,24 +96,24 @@ pub async fn check(
     if !admin_role_ids.is_empty() {
         // Capped at Discord's max page size — good enough to flag a risky
         // setup without paginating through every member on a huge server.
-        if let Ok(response) = http.guild_members(guild_id).limit(1000).await
-            && let Ok(members) = response.model().await
-        {
-            let admin_count = members
-                .iter()
-                .filter(|member| {
-                    member.user.id == guild.owner_id
-                        || member
-                            .roles
-                            .iter()
-                            .any(|role_id| admin_role_ids.contains(role_id))
-                })
-                .count();
+        if let Ok(response) = http.guild_members(guild_id).limit(1000).await {
+            if let Ok(members) = response.model().await {
+                let admin_count = members
+                    .iter()
+                    .filter(|member| {
+                        member.user.id == guild.owner_id
+                            || member
+                                .roles
+                                .iter()
+                                .any(|role_id| admin_role_ids.contains(role_id))
+                    })
+                    .count();
 
-            if admin_count > 0 {
-                medium.push(format!(
-                    "{admin_count} member(s) have Administrator permission."
-                ));
+                if admin_count > 0 {
+                    medium.push(format!(
+                        "{admin_count} member(s) have Administrator permission."
+                    ));
+                }
             }
         }
     }

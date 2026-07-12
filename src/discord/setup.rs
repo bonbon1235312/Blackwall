@@ -1,20 +1,19 @@
 use twilight_model::application::command::{Command, CommandType};
 use twilight_model::application::interaction::message_component::MessageComponentInteractionData;
 use twilight_model::application::interaction::{Interaction, InteractionContextType};
-use twilight_model::channel::ChannelType;
 use twilight_model::channel::message::component::{
-    ButtonStyle, SelectDefaultValue, SelectMenuType,
+    ActionRow, Button, ButtonStyle, SelectDefaultValue, SelectMenu, SelectMenuType,
 };
 use twilight_model::channel::message::{Component, Embed, MessageFlags};
+use twilight_model::channel::ChannelType;
 use twilight_model::guild::Permissions;
 use twilight_model::http::interaction::{InteractionResponse, InteractionResponseType};
 use twilight_model::id::{
-    Id,
     marker::{ChannelMarker, GuildMarker, RoleMarker},
+    Id,
 };
-use twilight_util::builder::InteractionResponseDataBuilder;
 use twilight_util::builder::command::CommandBuilder;
-use twilight_util::builder::message::{ActionRowBuilder, ButtonBuilder, SelectMenuBuilder};
+use twilight_util::builder::InteractionResponseDataBuilder;
 
 use crate::discord::embeds;
 use crate::moderation::permissions;
@@ -538,72 +537,87 @@ async fn build_panel(
 fn build_components(config: Option<&GuildConfig>) -> Vec<Component> {
     let initialized = config.is_some();
 
-    let mut log_channel_select =
-        SelectMenuBuilder::new(LOG_CHANNEL_SELECT_ID, SelectMenuType::Channel)
-            .channel_types(vec![ChannelType::GuildText])
-            .placeholder("Select log channel")
-            .min_values(1)
-            .max_values(1)
-            .disabled(!initialized);
-    if let Some(channel_id) = config.and_then(|config| config.log_channel_id) {
-        log_channel_select =
-            log_channel_select.default_values(vec![SelectDefaultValue::Channel(channel_id)]);
-    }
+    let log_channel_select = SelectMenu {
+        channel_types: Some(vec![ChannelType::GuildText]),
+        custom_id: LOG_CHANNEL_SELECT_ID.to_owned(),
+        default_values: config
+            .and_then(|config| config.log_channel_id)
+            .map(|channel_id| vec![SelectDefaultValue::Channel(channel_id)]),
+        disabled: !initialized,
+        kind: SelectMenuType::Channel,
+        max_values: Some(1),
+        min_values: Some(1),
+        options: None,
+        placeholder: Some("Select log channel".to_owned()),
+    };
 
-    let mut verified_role_select =
-        SelectMenuBuilder::new(VERIFIED_ROLE_SELECT_ID, SelectMenuType::Role)
-            .placeholder("Select verified role")
-            .min_values(1)
-            .max_values(1)
-            .disabled(!initialized);
-    if let Some(role_id) = config.and_then(|config| config.verified_role_id) {
-        verified_role_select =
-            verified_role_select.default_values(vec![SelectDefaultValue::Role(role_id)]);
-    }
+    let verified_role_select = SelectMenu {
+        channel_types: None,
+        custom_id: VERIFIED_ROLE_SELECT_ID.to_owned(),
+        default_values: config
+            .and_then(|config| config.verified_role_id)
+            .map(|role_id| vec![SelectDefaultValue::Role(role_id)]),
+        disabled: !initialized,
+        kind: SelectMenuType::Role,
+        max_values: Some(1),
+        min_values: Some(1),
+        options: None,
+        placeholder: Some("Select verified role".to_owned()),
+    };
 
-    let mut quarantine_role_select =
-        SelectMenuBuilder::new(QUARANTINE_ROLE_SELECT_ID, SelectMenuType::Role)
-            .placeholder("Select quarantine role")
-            .min_values(1)
-            .max_values(1)
-            .disabled(!initialized);
-    if let Some(role_id) = config.and_then(|config| config.quarantine_role_id) {
-        quarantine_role_select =
-            quarantine_role_select.default_values(vec![SelectDefaultValue::Role(role_id)]);
-    }
+    let quarantine_role_select = SelectMenu {
+        channel_types: None,
+        custom_id: QUARANTINE_ROLE_SELECT_ID.to_owned(),
+        default_values: config
+            .and_then(|config| config.quarantine_role_id)
+            .map(|role_id| vec![SelectDefaultValue::Role(role_id)]),
+        disabled: !initialized,
+        kind: SelectMenuType::Role,
+        max_values: Some(1),
+        min_values: Some(1),
+        options: None,
+        placeholder: Some("Select quarantine role".to_owned()),
+    };
 
-    let defaults_button = ButtonBuilder::new(ButtonStyle::Primary)
-        .custom_id(CREATE_DEFAULTS_ID)
-        .label(if initialized {
-            "Defaults Ready"
+    let defaults_button = Button {
+        custom_id: Some(CREATE_DEFAULTS_ID.to_owned()),
+        disabled: initialized,
+        emoji: None,
+        label: Some(if initialized {
+            "Defaults Ready".to_owned()
         } else {
-            "Create Defaults"
-        })
-        .disabled(initialized)
-        .build();
-    let quick_check_button = ButtonBuilder::new(ButtonStyle::Secondary)
-        .custom_id(QUICK_CHECK_ID)
-        .label("Quick Check")
-        .build();
+            "Create Defaults".to_owned()
+        }),
+        style: ButtonStyle::Primary,
+        url: None,
+        sku_id: None,
+    };
+    let quick_check_button = Button {
+        custom_id: Some(QUICK_CHECK_ID.to_owned()),
+        disabled: false,
+        emoji: None,
+        label: Some("Quick Check".to_owned()),
+        style: ButtonStyle::Secondary,
+        url: None,
+        sku_id: None,
+    };
 
     vec![
-        ActionRowBuilder::new()
-            .component(log_channel_select.build())
-            .build()
-            .into(),
-        ActionRowBuilder::new()
-            .component(verified_role_select.build())
-            .build()
-            .into(),
-        ActionRowBuilder::new()
-            .component(quarantine_role_select.build())
-            .build()
-            .into(),
-        ActionRowBuilder::new()
-            .component(defaults_button)
-            .component(quick_check_button)
-            .build()
-            .into(),
+        Component::ActionRow(ActionRow {
+            components: vec![Component::SelectMenu(log_channel_select)],
+        }),
+        Component::ActionRow(ActionRow {
+            components: vec![Component::SelectMenu(verified_role_select)],
+        }),
+        Component::ActionRow(ActionRow {
+            components: vec![Component::SelectMenu(quarantine_role_select)],
+        }),
+        Component::ActionRow(ActionRow {
+            components: vec![
+                Component::Button(defaults_button),
+                Component::Button(quick_check_button),
+            ],
+        }),
     ]
 }
 

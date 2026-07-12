@@ -1,12 +1,11 @@
 use twilight_model::application::command::{Command, CommandType};
 use twilight_model::application::interaction::{Interaction, InteractionContextType};
-use twilight_model::channel::message::component::ButtonStyle;
+use twilight_model::channel::message::component::{ActionRow, Button, ButtonStyle};
 use twilight_model::channel::message::{Component, MessageFlags};
 use twilight_model::guild::Permissions;
 use twilight_model::http::interaction::{InteractionResponse, InteractionResponseType};
-use twilight_util::builder::InteractionResponseDataBuilder;
 use twilight_util::builder::command::CommandBuilder;
-use twilight_util::builder::message::{ActionRowBuilder, ButtonBuilder};
+use twilight_util::builder::InteractionResponseDataBuilder;
 
 use crate::discord::embeds;
 use crate::state::AppState;
@@ -63,11 +62,18 @@ pub async fn handle(interaction: &Interaction, state: &AppState) {
     };
 
     let verify_url = format!("{}/verify?guild_id={guild_id}", state.public_base_url);
-    let button = ButtonBuilder::new(ButtonStyle::Link)
-        .label("Verify")
-        .url(verify_url)
-        .build();
-    let action_row = ActionRowBuilder::new().component(button).build();
+    let button = Button {
+        custom_id: None,
+        disabled: false,
+        emoji: None,
+        label: Some("Verify".to_owned()),
+        style: ButtonStyle::Link,
+        url: Some(verify_url),
+        sku_id: None,
+    };
+    let action_row = ActionRow {
+        components: vec![Component::Button(button)],
+    };
     let panel_embed = embeds::verify_panel();
     let embeds = [panel_embed];
     let components = [Component::ActionRow(action_row)];

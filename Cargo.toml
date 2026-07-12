@@ -1,23 +1,31 @@
 [package]
 name = "blackwall"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+rust-version = "1.82"
 
 [dependencies]
 aho-corasick = "1.1.4"
 axum = "0.8.9"
 dashmap = "6.2.1"
 dotenvy = "0.15.7"
-rand = "0.10.2"
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "form"] }
+rand = "=0.9.3"
+reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls", "json"] }
 rustls = { version = "0.23.41", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls"] }
+sqlx = { version = "=0.8.6", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls"] }
 tokio = { version = "1.52.3", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-twilight-gateway = "0.17.1"
-twilight-http = "0.17.1"
-twilight-model = "0.17.1"
-twilight-util = { version = "0.17.0", features = ["builder"] }
+# Twilight accepts any time 0.3 release. Versions 0.3.6 through 0.3.46
+# contain RUSTSEC-2026-0009, while the patched line requires Rust 1.88.
+# 0.3.5 is unaffected and still supplies Twilight's parsing API on 1.82.
+time = { version = "=0.3.5", default-features = false, features = ["parsing", "std"] }
+twilight-gateway = "=0.16.0"
+twilight-http = "=0.16.0"
+twilight-model = "=0.16.0"
+twilight-util = { version = "=0.16.0", features = ["builder"] }
+# Cargo 1.82 predates MSRV-aware fallback and otherwise resolves 0.11.6,
+# which requires Rust 1.83. Keep this exact pin in sync with Cargo.lock.
+zerovec = "=0.11.5"

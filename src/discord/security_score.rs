@@ -3,9 +3,9 @@ use twilight_model::application::interaction::{Interaction, InteractionContextTy
 use twilight_model::channel::message::{Embed, MessageFlags};
 use twilight_model::guild::Permissions;
 use twilight_model::http::interaction::{InteractionResponse, InteractionResponseType};
-use twilight_util::builder::InteractionResponseDataBuilder;
 use twilight_util::builder::command::CommandBuilder;
 use twilight_util::builder::embed::{EmbedBuilder, EmbedFieldBuilder};
+use twilight_util::builder::InteractionResponseDataBuilder;
 
 use crate::moderation::permissions::{self, PermissionFindings};
 use crate::state::AppState;
@@ -86,32 +86,30 @@ pub async fn handle(interaction: &Interaction, state: &AppState) {
     // moderating (anything with a dangerous permission)? If not, the
     // anti-nuke/quarantine responses that rely on the bot outranking the
     // target can't actually work.
-    if let Ok(bot_member_response) = state.http.current_user_guild_member(guild_id).await
-        && let Ok(bot_member) = bot_member_response.model().await
-    {
-        let bot_highest_position = roles
-            .iter()
-            .filter(|role| bot_member.roles.contains(&role.id))
-            .map(|role| role.position)
-            .max()
-            .unwrap_or(0);
+    if let Ok(bot_member_response) = state.http.current_user_guild_member(guild_id).await {
+        if let Ok(bot_member) = bot_member_response.model().await {
+            let bot_highest_position = roles
+                .iter()
+                .filter(|role| bot_member.roles.contains(&role.id))
+                .map(|role| role.position)
+                .max()
+                .unwrap_or(0);
 
-        let dangerous_ids = permissions::dangerous_role_ids(&roles);
-        let highest_dangerous_position = roles
-            .iter()
-            .filter(|role| dangerous_ids.contains(&role.id) && role.id.get() != guild_id.get())
-            .map(|role| role.position)
-            .max();
+            let dangerous_ids = permissions::dangerous_role_ids(&roles);
+            let highest_dangerous_position = roles
+                .iter()
+                .filter(|role| dangerous_ids.contains(&role.id) && role.id.get() != guild_id.get())
+                .map(|role| role.position)
+                .max();
 
-        if let Some(highest_dangerous_position) = highest_dangerous_position
-            && bot_highest_position <= highest_dangerous_position
-        {
-            findings.critical.push(
-                "Blackwall's own role is not positioned above other privileged roles in \
+            if highest_dangerous_position.is_some_and(|position| bot_highest_position <= position) {
+                findings.critical.push(
+                    "Blackwall's own role is not positioned above other privileged roles in \
                 Server Settings -> Roles — it may not be able to moderate members who have \
                 them (anti-nuke role stripping, quarantine, timeouts)."
-                    .to_string(),
-            );
+                        .to_string(),
+                );
+            }
         }
     }
 

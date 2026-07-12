@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
 use twilight_model::application::command::{Command, CommandType};
 use twilight_model::application::interaction::{Interaction, InteractionContextType};
-use twilight_model::channel::ChannelType;
 use twilight_model::channel::message::MessageFlags;
+use twilight_model::channel::ChannelType;
 use twilight_model::guild::Permissions;
 use twilight_model::http::interaction::{InteractionResponse, InteractionResponseType};
-use twilight_util::builder::InteractionResponseDataBuilder;
 use twilight_util::builder::command::CommandBuilder;
+use twilight_util::builder::InteractionResponseDataBuilder;
 
 use crate::state::AppState;
 use crate::storage::models;
@@ -147,7 +147,7 @@ pub async fn handle_backup(interaction: &Interaction, state: &AppState) {
         .map(|role| RoleBackup {
             name: role.name.clone(),
             permission_bits: role.permissions.bits(),
-            color: role.colors.primary_color,
+            color: role.color,
             hoist: role.hoist,
             mentionable: role.mentionable,
         })
