@@ -16,6 +16,7 @@ use twilight_util::builder::command::CommandBuilder;
 use twilight_util::builder::InteractionResponseDataBuilder;
 
 use crate::discord::embeds;
+use crate::discord::source::CommandSource;
 use crate::moderation::permissions;
 use crate::state::AppState;
 use crate::storage::models::{self, GuildConfig};
@@ -52,29 +53,52 @@ pub fn handles_component(custom_id: &str) -> bool {
 
 /// Opens the private setup panel. This does no Discord REST work, so the
 /// command can always acknowledge immediately.
-pub async fn handle_command(interaction: &Interaction, state: &AppState) {
-    let Some(guild_id) = interaction.guild_id else {
-        respond_error(
-            interaction,
-            state,
-            "This command can only be used in a server.",
-        )
-        .await;
+///
+/// Slash-command only, deliberately: the panel includes the quick-check's
+/// critical/medium security findings (exact permission misconfigurations)
+/// alongside admin-only config controls. Discord's "ephemeral, visible
+/// only to the invoker" reply mode exists solely for interaction
+/// responses — a `!setup` prefix command has no such mechanism, since a
+/// plain bot-sent channel message is always public. Posting the panel
+/// there would hand every member, including a would-be attacker, a live
+/// readout of exactly which security gaps to exploit. `!setup` refuses
+/// and points to `/setup` instead of downgrading that privacy guarantee.
+pub async fn handle_command(source: &CommandSource<'_>, state: &AppState) {
+    if let CommandSource::Message(_) = source {
+        source
+            .reply(
+                state,
+                "`/setup` only works as a real slash command — its panel shows security \
+                findings that need to stay private to you, and Discord can only keep a reply \
+                private when it's a response to a slash command, not a plain message. Type \
+                `/setup` instead.",
+            )
+            .await;
+        return;
+    }
+
+    let Some(guild_id) = source.guild_id() else {
+        source
+            .reply(state, "This command can only be used in a server.")
+            .await;
         return;
     };
 
-    if !invoker_has_manage_guild(interaction) {
-        respond_error(
-            interaction,
-            state,
-            "You need the **Manage Server** permission to open Blackwall setup.",
-        )
-        .await;
+    let permissions = source.invoker_permissions(state).await;
+    if !permissions.contains(Permissions::MANAGE_GUILD)
+        && !permissions.contains(Permissions::ADMINISTRATOR)
+    {
+        source
+            .reply(
+                state,
+                "You need the **Manage Server** permission to open Blackwall setup.",
+            )
+            .await;
         return;
     }
 
     let panel = build_panel(state, guild_id, None, &[]).await;
-    respond_with_panel(interaction, state, panel).await;
+    source.reply_with_panel(state, panel.embed, panel.components).await;
 }
 
 /// Handles a selection or button click from the setup panel.
@@ -694,21 +718,6 @@ fn invoker_has_manage_guild(interaction: &Interaction) -> bool {
             permissions.contains(Permissions::MANAGE_GUILD)
                 || permissions.contains(Permissions::ADMINISTRATOR)
         })
-}
-
-async fn respond_with_panel(interaction: &Interaction, state: &AppState, panel: SetupPanel) {
-    let data = InteractionResponseDataBuilder::new()
-        .embeds([panel.embed])
-        .components(panel.components)
-        .flags(MessageFlags::EPHEMERAL)
-        .build();
-    send_response(
-        interaction,
-        state,
-        InteractionResponseType::ChannelMessageWithSource,
-        Some(data),
-    )
-    .await;
 }
 
 async fn update_panel(

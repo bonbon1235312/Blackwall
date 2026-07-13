@@ -2,6 +2,7 @@ use twilight_model::application::interaction::{Interaction, InteractionData};
 use twilight_model::http::interaction::{InteractionResponse, InteractionResponseType};
 use twilight_util::builder::InteractionResponseDataBuilder;
 
+use crate::discord::source::CommandSource;
 use crate::discord::{backup, config, lockdown, moderate, security_score, setup, verify_panel};
 use crate::state::AppState;
 
@@ -14,22 +15,25 @@ use crate::state::AppState;
 /// build their own response.
 pub async fn handle(interaction: Interaction, state: &AppState) {
     match interaction.data.as_ref() {
-        Some(InteractionData::ApplicationCommand(command)) => match command.name.as_str() {
-            "ping" => respond_pong(&interaction, state).await,
-            "setup" => setup::handle_command(&interaction, state).await,
-            "verify-panel" => verify_panel::handle(&interaction, state).await,
-            "lockdown" => lockdown::handle_lockdown(&interaction, state).await,
-            "unlockdown" => lockdown::handle_unlockdown(&interaction, state).await,
-            "security-score" => security_score::handle(&interaction, state).await,
-            "backup" => backup::handle_backup(&interaction, state).await,
-            "restore" => backup::handle_restore(&interaction, state).await,
-            "config" => config::handle(&interaction, state).await,
-            "ban" => moderate::handle_ban(&interaction, state).await,
-            "kick" => moderate::handle_kick(&interaction, state).await,
-            "timeout" => moderate::handle_timeout(&interaction, state).await,
-            "warn" => moderate::handle_warn(&interaction, state).await,
-            other => tracing::warn!(command = other, "received unknown slash command"),
-        },
+        Some(InteractionData::ApplicationCommand(command)) => {
+            let source = CommandSource::Interaction(&interaction);
+            match command.name.as_str() {
+                "ping" => respond_pong(&interaction, state).await,
+                "setup" => setup::handle_command(&source, state).await,
+                "verify-panel" => verify_panel::handle(&source, state).await,
+                "lockdown" => lockdown::handle_lockdown(&source, state).await,
+                "unlockdown" => lockdown::handle_unlockdown(&source, state).await,
+                "security-score" => security_score::handle(&source, state).await,
+                "backup" => backup::handle_backup(&source, state).await,
+                "restore" => backup::handle_restore(&source, state).await,
+                "config" => config::handle(&source, state, None).await,
+                "ban" => moderate::handle_ban(&source, state, None).await,
+                "kick" => moderate::handle_kick(&source, state, None).await,
+                "timeout" => moderate::handle_timeout(&source, state, None).await,
+                "warn" => moderate::handle_warn(&source, state, None).await,
+                other => tracing::warn!(command = other, "received unknown slash command"),
+            }
+        }
         Some(InteractionData::MessageComponent(component))
             if setup::handles_component(&component.custom_id) =>
         {

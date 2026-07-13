@@ -9,7 +9,7 @@ use twilight_model::id::marker::{GuildMarker, UserMarker};
 use twilight_model::id::Id;
 
 use crate::actions::lockdown;
-use crate::discord::{embeds, interactions};
+use crate::discord::{embeds, interactions, prefix};
 use crate::moderation::invite;
 use crate::moderation::nuke::NukeViolation;
 use crate::moderation::permissions;
@@ -96,6 +96,13 @@ async fn handle_event(event: Event, state: Arc<AppState>) {
             let Some(guild_id) = message.guild_id else {
                 return;
             };
+
+            // `!`/`?` prefix commands are a separate concern from message
+            // moderation below — a recognized command message is never
+            // itself scanned for scam patterns or counted toward spam.
+            if prefix::try_handle(&message, &state).await {
+                return;
+            }
 
             let settings = state.settings_cache.get(&state.db, guild_id).await;
 

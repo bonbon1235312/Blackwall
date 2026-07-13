@@ -1,12 +1,11 @@
 use twilight_model::application::command::{Command, CommandType};
-use twilight_model::application::interaction::{Interaction, InteractionContextType};
-use twilight_model::channel::message::{Embed, MessageFlags};
+use twilight_model::application::interaction::InteractionContextType;
+use twilight_model::channel::message::Embed;
 use twilight_model::guild::Permissions;
-use twilight_model::http::interaction::{InteractionResponse, InteractionResponseType};
 use twilight_util::builder::command::CommandBuilder;
 use twilight_util::builder::embed::{EmbedBuilder, EmbedFieldBuilder};
-use twilight_util::builder::InteractionResponseDataBuilder;
 
+use crate::discord::source::CommandSource;
 use crate::moderation::permissions::{self, PermissionFindings};
 use crate::state::AppState;
 use crate::storage::models;
@@ -21,62 +20,67 @@ pub fn command() -> Command {
     .build()
 }
 
-pub async fn handle(interaction: &Interaction, state: &AppState) {
-    let Some(guild_id) = interaction.guild_id else {
-        respond(
-            interaction,
-            state,
-            "This command can only be used in a server.",
-        )
-        .await;
+/// Slash-command only. This shows exact critical/medium security findings
+/// (specific permission misconfigurations) — Discord can only keep a
+/// reply private when it's a response to a slash command, never for a
+/// plain message a `!security-score` prefix invocation would be. Posting
+/// this publicly would hand every member, including a would-be attacker,
+/// a live readout of what to exploit.
+pub async fn handle(source: &CommandSource<'_>, state: &AppState) {
+    if let CommandSource::Message(_) = source {
+        source
+            .reply(
+                state,
+                "`/security-score` only works as a real slash command — its findings need to \
+                stay private to you. Type `/security-score` instead.",
+            )
+            .await;
+        return;
+    }
+
+    let Some(guild_id) = source.guild_id() else {
+        source
+            .reply(state, "This command can only be used in a server.")
+            .await;
         return;
     };
 
-    if !invoker_has_manage_guild(interaction) {
-        respond(
-            interaction,
-            state,
-            "You need the **Manage Server** permission to run `/security-score`.",
-        )
-        .await;
+    let permissions = source.invoker_permissions(state).await;
+    if !permissions.contains(Permissions::MANAGE_GUILD)
+        && !permissions.contains(Permissions::ADMINISTRATOR)
+    {
+        source
+            .reply(
+                state,
+                "You need the **Manage Server** permission to run `/security-score`.",
+            )
+            .await;
         return;
     }
 
     let Ok(guild) = state.http.guild(guild_id).await else {
-        respond(
-            interaction,
-            state,
-            "Couldn't load this server from Discord.",
-        )
-        .await;
+        source
+            .reply(state, "Couldn't load this server from Discord.")
+            .await;
         return;
     };
     let Ok(guild) = guild.model().await else {
-        respond(
-            interaction,
-            state,
-            "Discord sent back a server we couldn't read.",
-        )
-        .await;
+        source
+            .reply(state, "Discord sent back a server we couldn't read.")
+            .await;
         return;
     };
 
     let Ok(roles) = state.http.roles(guild_id).await else {
-        respond(
-            interaction,
-            state,
-            "Couldn't load this server's roles from Discord.",
-        )
-        .await;
+        source
+            .reply(state, "Couldn't load this server's roles from Discord.")
+            .await;
         return;
     };
     let Ok(roles) = roles.model().await else {
-        respond(
-            interaction,
-            state,
-            "Discord sent back roles we couldn't read.",
-        )
-        .await;
+        source
+            .reply(state, "Discord sent back roles we couldn't read.")
+            .await;
         return;
     };
 
@@ -123,7 +127,7 @@ pub async fn handle(interaction: &Interaction, state: &AppState) {
     .await;
 
     let embed = build_score_embed(&findings);
-    respond_with_embed(interaction, state, embed).await;
+    source.reply_with_embed(state, embed).await;
 }
 
 fn build_score_embed(findings: &PermissionFindings) -> Embed {
@@ -163,52 +167,3 @@ fn build_score_embed(findings: &PermissionFindings) -> Embed {
         .build()
 }
 
-fn invoker_has_manage_guild(interaction: &Interaction) -> bool {
-    interaction
-        .member
-        .as_ref()
-        .and_then(|member| member.permissions)
-        .is_some_and(|permissions| {
-            permissions.contains(Permissions::MANAGE_GUILD)
-                || permissions.contains(Permissions::ADMINISTRATOR)
-        })
-}
-
-async fn respond(interaction: &Interaction, state: &AppState, content: &str) {
-    let mut data = InteractionResponseDataBuilder::new()
-        .content(content)
-        .build();
-    data.flags = Some(MessageFlags::EPHEMERAL);
-
-    send_response(interaction, state, data).await;
-}
-
-async fn respond_with_embed(interaction: &Interaction, state: &AppState, embed: Embed) {
-    let mut data = InteractionResponseDataBuilder::new()
-        .embeds([embed])
-        .build();
-    data.flags = Some(MessageFlags::EPHEMERAL);
-
-    send_response(interaction, state, data).await;
-}
-
-async fn send_response(
-    interaction: &Interaction,
-    state: &AppState,
-    data: twilight_model::http::interaction::InteractionResponseData,
-) {
-    let response = InteractionResponse {
-        kind: InteractionResponseType::ChannelMessageWithSource,
-        data: Some(data),
-    };
-
-    let result = state
-        .http
-        .interaction(state.application_id)
-        .create_response(interaction.id, &interaction.token, &response)
-        .await;
-
-    if let Err(source) = result {
-        tracing::error!(?source, "failed to respond to /security-score interaction");
-    }
-}

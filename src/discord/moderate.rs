@@ -1,18 +1,16 @@
 use twilight_http::request::AuditLogReason;
 use twilight_model::application::command::{Command, CommandType};
 use twilight_model::application::interaction::application_command::CommandOptionValue;
-use twilight_model::application::interaction::{Interaction, InteractionContextType, InteractionData};
-use twilight_model::channel::message::MessageFlags;
+use twilight_model::application::interaction::{InteractionContextType, InteractionData};
 use twilight_model::guild::Permissions;
-use twilight_model::http::interaction::{InteractionResponse, InteractionResponseType};
 use twilight_model::id::{
     marker::{GuildMarker, UserMarker},
     Id,
 };
 use twilight_util::builder::command::{CommandBuilder, IntegerBuilder, StringBuilder, UserBuilder};
-use twilight_util::builder::InteractionResponseDataBuilder;
 
 use crate::discord::embeds;
+use crate::discord::source::CommandSource;
 use crate::moderation::raid;
 use crate::state::AppState;
 use crate::storage::models;
@@ -52,18 +50,25 @@ pub fn commands() -> Vec<Command> {
     ]
 }
 
-pub async fn handle_ban(interaction: &Interaction, state: &AppState) {
-    let Some((guild_id, target_id, reason)) = required_target(interaction) else {
+pub async fn handle_ban(source: &CommandSource<'_>, state: &AppState, prefix_args: Option<&str>) {
+    let Some((guild_id, target_id, reason)) = required_target(source, prefix_args) else {
+        source
+            .reply(state, "Usage: `/ban user:@member [reason]` or `!ban @member [reason]`.")
+            .await;
         return;
     };
 
-    if !invoker_has(interaction, Permissions::BAN_MEMBERS) {
-        respond(interaction, state, "You need the **Ban Members** permission to do that.").await;
+    if !has(source, state, Permissions::BAN_MEMBERS).await {
+        source
+            .reply(state, "You need the **Ban Members** permission to do that.")
+            .await;
         return;
     }
 
     if is_owner(state, guild_id, target_id).await {
-        respond(interaction, state, "Discord does not allow moderating the server owner.").await;
+        source
+            .reply(state, "Discord does not allow moderating the server owner.")
+            .await;
         return;
     }
 
@@ -74,12 +79,12 @@ pub async fn handle_ban(interaction: &Interaction, state: &AppState) {
 
     let outcome = request.await;
     let succeeded = outcome.is_ok();
-    if let Err(source) = outcome {
-        tracing::error!(?source, %guild_id, %target_id, "failed to ban member via /ban");
+    if let Err(error) = outcome {
+        tracing::error!(?error, %guild_id, %target_id, "failed to ban member via /ban");
     }
 
     finish(
-        interaction,
+        source,
         state,
         guild_id,
         target_id,
@@ -92,18 +97,25 @@ pub async fn handle_ban(interaction: &Interaction, state: &AppState) {
     .await;
 }
 
-pub async fn handle_kick(interaction: &Interaction, state: &AppState) {
-    let Some((guild_id, target_id, reason)) = required_target(interaction) else {
+pub async fn handle_kick(source: &CommandSource<'_>, state: &AppState, prefix_args: Option<&str>) {
+    let Some((guild_id, target_id, reason)) = required_target(source, prefix_args) else {
+        source
+            .reply(state, "Usage: `/kick user:@member [reason]` or `!kick @member [reason]`.")
+            .await;
         return;
     };
 
-    if !invoker_has(interaction, Permissions::KICK_MEMBERS) {
-        respond(interaction, state, "You need the **Kick Members** permission to do that.").await;
+    if !has(source, state, Permissions::KICK_MEMBERS).await {
+        source
+            .reply(state, "You need the **Kick Members** permission to do that.")
+            .await;
         return;
     }
 
     if is_owner(state, guild_id, target_id).await {
-        respond(interaction, state, "Discord does not allow moderating the server owner.").await;
+        source
+            .reply(state, "Discord does not allow moderating the server owner.")
+            .await;
         return;
     }
 
@@ -114,12 +126,12 @@ pub async fn handle_kick(interaction: &Interaction, state: &AppState) {
 
     let outcome = request.await;
     let succeeded = outcome.is_ok();
-    if let Err(source) = outcome {
-        tracing::error!(?source, %guild_id, %target_id, "failed to kick member via /kick");
+    if let Err(error) = outcome {
+        tracing::error!(?error, %guild_id, %target_id, "failed to kick member via /kick");
     }
 
     finish(
-        interaction,
+        source,
         state,
         guild_id,
         target_id,
@@ -132,30 +144,32 @@ pub async fn handle_kick(interaction: &Interaction, state: &AppState) {
     .await;
 }
 
-pub async fn handle_timeout(interaction: &Interaction, state: &AppState) {
-    let Some((guild_id, target_id, reason)) = required_target(interaction) else {
+pub async fn handle_timeout(source: &CommandSource<'_>, state: &AppState, prefix_args: Option<&str>) {
+    let Some((guild_id, target_id, minutes, reason)) = required_target_with_duration(source, prefix_args)
+    else {
+        source
+            .reply(
+                state,
+                "Usage: `/timeout user:@member duration-minutes:30 [reason]` or \
+                `!timeout @member 30 [reason]`.",
+            )
+            .await;
         return;
     };
 
-    if !invoker_has(interaction, Permissions::MODERATE_MEMBERS) {
-        respond(
-            interaction,
-            state,
-            "You need the **Timeout Members** permission to do that.",
-        )
-        .await;
+    if !has(source, state, Permissions::MODERATE_MEMBERS).await {
+        source
+            .reply(state, "You need the **Timeout Members** permission to do that.")
+            .await;
         return;
     }
 
     if is_owner(state, guild_id, target_id).await {
-        respond(interaction, state, "Discord does not allow moderating the server owner.").await;
+        source
+            .reply(state, "Discord does not allow moderating the server owner.")
+            .await;
         return;
     }
-
-    let Some(minutes) = integer_option(interaction, OPT_DURATION_MINUTES) else {
-        respond(interaction, state, "A timeout duration is required.").await;
-        return;
-    };
 
     let until = raid::raid_timeout_until(std::time::Duration::from_secs(minutes as u64 * 60));
 
@@ -169,12 +183,12 @@ pub async fn handle_timeout(interaction: &Interaction, state: &AppState) {
 
     let outcome = request.await;
     let succeeded = outcome.is_ok();
-    if let Err(source) = outcome {
-        tracing::error!(?source, %guild_id, %target_id, "failed to time out member via /timeout");
+    if let Err(error) = outcome {
+        tracing::error!(?error, %guild_id, %target_id, "failed to time out member via /timeout");
     }
 
     finish(
-        interaction,
+        source,
         state,
         guild_id,
         target_id,
@@ -187,17 +201,23 @@ pub async fn handle_timeout(interaction: &Interaction, state: &AppState) {
     .await;
 }
 
-pub async fn handle_warn(interaction: &Interaction, state: &AppState) {
-    let Some((guild_id, target_id, reason)) = required_target(interaction) else {
+pub async fn handle_warn(source: &CommandSource<'_>, state: &AppState, prefix_args: Option<&str>) {
+    let Some((guild_id, target_id, reason)) = required_target(source, prefix_args) else {
+        source
+            .reply(state, "Usage: `/warn user:@member reason:...` or `!warn @member reason...`.")
+            .await;
         return;
     };
     let Some(reason) = reason else {
-        respond(interaction, state, "A reason is required to warn someone.").await;
+        source
+            .reply(state, "A reason is required to warn someone.")
+            .await;
         return;
     };
 
-    if !invoker_has(interaction, Permissions::MODERATE_MEMBERS) {
-        respond(interaction, state, "You need the **Timeout Members** permission to do that.")
+    if !has(source, state, Permissions::MODERATE_MEMBERS).await {
+        source
+            .reply(state, "You need the **Timeout Members** permission to do that.")
             .await;
         return;
     }
@@ -220,7 +240,7 @@ pub async fn handle_warn(interaction: &Interaction, state: &AppState) {
     };
 
     finish(
-        interaction,
+        source,
         state,
         guild_id,
         target_id,
@@ -244,7 +264,7 @@ pub async fn handle_warn(interaction: &Interaction, state: &AppState) {
 /// shape.
 #[allow(clippy::too_many_arguments)]
 async fn finish(
-    interaction: &Interaction,
+    source: &CommandSource<'_>,
     state: &AppState,
     guild_id: Id<GuildMarker>,
     target_id: Id<UserMarker>,
@@ -254,11 +274,7 @@ async fn finish(
     action_label: &str,
     outcome_label: &str,
 ) {
-    let moderator_id = interaction
-        .member
-        .as_ref()
-        .and_then(|member| member.user.as_ref())
-        .map(|user| user.id);
+    let moderator_id = source.invoker_id();
 
     let description = format!(
         "{action_label} <@{target_id}>{}. {}",
@@ -270,7 +286,7 @@ async fn finish(
         }
     );
 
-    if let Err(source) = models::record_security_event(
+    if let Err(error) = models::record_security_event(
         &state.db,
         guild_id,
         Some(target_id),
@@ -280,10 +296,10 @@ async fn finish(
     )
     .await
     {
-        tracing::error!(?source, %guild_id, "failed to record moderation-command security event");
+        tracing::error!(?error, %guild_id, "failed to record moderation-command security event");
     }
 
-    respond(interaction, state, &description).await;
+    source.reply(state, &description).await;
 
     let Some(log_channel_id) = models::get_log_channel_id(&state.db, guild_id).await else {
         return;
@@ -298,38 +314,101 @@ async fn finish(
         outcome_label,
     );
 
-    if let Err(source) = state
+    if let Err(error) = state
         .http
         .create_message(log_channel_id)
         .embeds(&[embed])
         .await
     {
-        tracing::error!(?source, %guild_id, "failed to send moderation-command log embed");
+        tracing::error!(?error, %guild_id, "failed to send moderation-command log embed");
     }
 }
 
-/// Pulls `(guild_id, target user, optional reason)` out of the invoking
-/// interaction. Returns `None` (and has already replied) if this wasn't
-/// invoked in a guild — every other precondition is checked by the
-/// caller, since the required permission differs per command.
+/// Parses `<@123>`, `<@!123>` (Discord mention formats), or a bare
+/// numeric ID into a user ID — the three shapes a prefix command's first
+/// argument can take when someone types or @-mentions a target.
+fn parse_user_token(token: &str) -> Option<Id<UserMarker>> {
+    let mention_inner = token
+        .strip_prefix("<@")
+        .and_then(|rest| rest.strip_suffix('>'));
+    let digits = match mention_inner {
+        Some(inner) => inner.strip_prefix('!').unwrap_or(inner),
+        None => token,
+    };
+
+    digits.parse().ok()
+}
+
+/// Pulls `(guild_id, target user, optional reason)` for `/ban`, `/kick`,
+/// and `/warn` — from the interaction's real options, or from prefix text
+/// shaped `<target> [reason...]`.
 fn required_target(
-    interaction: &Interaction,
+    source: &CommandSource<'_>,
+    prefix_args: Option<&str>,
 ) -> Option<(Id<GuildMarker>, Id<UserMarker>, Option<String>)> {
-    let guild_id = interaction.guild_id?;
-    let target_id = user_option(interaction, OPT_USER)?;
-    let reason = string_option(interaction, OPT_REASON);
+    let guild_id = source.guild_id()?;
+
+    let (target_id, reason) = match source {
+        CommandSource::Interaction(interaction) => (
+            user_option(interaction, OPT_USER)?,
+            string_option(interaction, OPT_REASON),
+        ),
+        CommandSource::Message(_) => {
+            let args = prefix_args?.trim();
+            let (target_token, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+            let target_id = parse_user_token(target_token)?;
+            let reason = rest.trim();
+            (target_id, (!reason.is_empty()).then(|| reason.to_owned()))
+        }
+    };
 
     Some((guild_id, target_id, reason))
 }
 
-fn command_options(interaction: &Interaction) -> &[twilight_model::application::interaction::application_command::CommandDataOption] {
+/// `(guild_id, target user, timeout minutes, optional reason)`.
+type TimeoutTarget = (Id<GuildMarker>, Id<UserMarker>, i64, Option<String>);
+
+/// Same as `required_target`, plus a required duration in minutes —
+/// `/timeout`'s own extra option, or a second positional prefix argument
+/// (`!timeout <target> <minutes> [reason...]`).
+fn required_target_with_duration(
+    source: &CommandSource<'_>,
+    prefix_args: Option<&str>,
+) -> Option<TimeoutTarget> {
+    let guild_id = source.guild_id()?;
+
+    let (target_id, minutes, reason) = match source {
+        CommandSource::Interaction(interaction) => (
+            user_option(interaction, OPT_USER)?,
+            integer_option(interaction, OPT_DURATION_MINUTES)?,
+            string_option(interaction, OPT_REASON),
+        ),
+        CommandSource::Message(_) => {
+            let args = prefix_args?.trim();
+            let mut parts = args.splitn(3, char::is_whitespace);
+            let target_id = parse_user_token(parts.next()?)?;
+            let minutes: i64 = parts.next()?.parse().ok()?;
+            let reason = parts.next().unwrap_or("").trim();
+            (target_id, minutes, (!reason.is_empty()).then(|| reason.to_owned()))
+        }
+    };
+
+    Some((guild_id, target_id, minutes, reason))
+}
+
+fn command_options(
+    interaction: &twilight_model::application::interaction::Interaction,
+) -> &[twilight_model::application::interaction::application_command::CommandDataOption] {
     match interaction.data.as_ref() {
         Some(InteractionData::ApplicationCommand(command)) => &command.options,
         _ => &[],
     }
 }
 
-fn user_option(interaction: &Interaction, name: &str) -> Option<Id<UserMarker>> {
+fn user_option(
+    interaction: &twilight_model::application::interaction::Interaction,
+    name: &str,
+) -> Option<Id<UserMarker>> {
     command_options(interaction).iter().find_map(|option| {
         if option.name == name {
             if let CommandOptionValue::User(id) = option.value {
@@ -340,7 +419,10 @@ fn user_option(interaction: &Interaction, name: &str) -> Option<Id<UserMarker>> 
     })
 }
 
-fn string_option(interaction: &Interaction, name: &str) -> Option<String> {
+fn string_option(
+    interaction: &twilight_model::application::interaction::Interaction,
+    name: &str,
+) -> Option<String> {
     command_options(interaction).iter().find_map(|option| {
         if option.name == name {
             if let CommandOptionValue::String(value) = &option.value {
@@ -351,7 +433,10 @@ fn string_option(interaction: &Interaction, name: &str) -> Option<String> {
     })
 }
 
-fn integer_option(interaction: &Interaction, name: &str) -> Option<i64> {
+fn integer_option(
+    interaction: &twilight_model::application::interaction::Interaction,
+    name: &str,
+) -> Option<i64> {
     command_options(interaction).iter().find_map(|option| {
         if option.name == name {
             if let CommandOptionValue::Integer(value) = option.value {
@@ -366,32 +451,7 @@ async fn is_owner(state: &AppState, guild_id: Id<GuildMarker>, user_id: Id<UserM
     models::get_owner_id(&state.db, guild_id).await == Some(user_id)
 }
 
-fn invoker_has(interaction: &Interaction, permission: Permissions) -> bool {
-    interaction
-        .member
-        .as_ref()
-        .and_then(|member| member.permissions)
-        .is_some_and(|permissions| {
-            permissions.contains(permission) || permissions.contains(Permissions::ADMINISTRATOR)
-        })
-}
-
-async fn respond(interaction: &Interaction, state: &AppState, content: &str) {
-    let data = InteractionResponseDataBuilder::new()
-        .content(content)
-        .flags(MessageFlags::EPHEMERAL)
-        .build();
-    let response = InteractionResponse {
-        kind: InteractionResponseType::ChannelMessageWithSource,
-        data: Some(data),
-    };
-
-    if let Err(source) = state
-        .http
-        .interaction(state.application_id)
-        .create_response(interaction.id, &interaction.token, &response)
-        .await
-    {
-        tracing::error!(?source, "failed to respond to moderation-command interaction");
-    }
+async fn has(source: &CommandSource<'_>, state: &AppState, permission: Permissions) -> bool {
+    let permissions = source.invoker_permissions(state).await;
+    permissions.contains(permission) || permissions.contains(Permissions::ADMINISTRATOR)
 }

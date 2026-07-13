@@ -1,13 +1,12 @@
 use twilight_model::application::command::{Command, CommandType};
 use twilight_model::application::interaction::application_command::CommandOptionValue;
-use twilight_model::application::interaction::{Interaction, InteractionContextType};
-use twilight_model::channel::message::{Embed, MessageFlags};
+use twilight_model::application::interaction::{InteractionContextType, InteractionData};
+use twilight_model::channel::message::Embed;
 use twilight_model::guild::Permissions;
-use twilight_model::http::interaction::{InteractionResponse, InteractionResponseType};
 use twilight_util::builder::command::{CommandBuilder, IntegerBuilder};
 use twilight_util::builder::embed::{EmbedBuilder, EmbedFieldBuilder};
-use twilight_util::builder::InteractionResponseDataBuilder;
 
+use crate::discord::source::CommandSource;
 use crate::state::AppState;
 use crate::storage::models;
 
@@ -95,43 +94,84 @@ pub fn command() -> Command {
     .build()
 }
 
-pub async fn handle(interaction: &Interaction, state: &AppState) {
-    let Some(guild_id) = interaction.guild_id else {
-        respond(
-            interaction,
-            state,
-            "This command can only be used in a server.",
-        )
-        .await;
+/// Every recognized `key:value` pair, sourced from either the slash
+/// command's real integer options or (for a prefix invocation) parsed
+/// text like `raid-burst:15 nuke-burst:2`. Unrecognized keys and
+/// unparseable values are silently skipped, same as an interaction option
+/// that isn't one of the ones `command()` declares.
+fn parse_args(source: &CommandSource<'_>, prefix_args: Option<&str>) -> Vec<(&'static str, i32)> {
+    const KNOWN: [&str; 8] = [
+        OPT_RAID_BURST,
+        OPT_RAID_SUSPICIOUS,
+        OPT_NUKE_BURST,
+        OPT_SPAM_BURST,
+        OPT_SPAM_REPEAT,
+        OPT_SPAM_MENTION,
+        OPT_SPAM_TIMEOUT_MINUTES,
+        OPT_RAID_TIMEOUT_MINUTES,
+    ];
+
+    match source {
+        CommandSource::Interaction(interaction) => {
+            let Some(InteractionData::ApplicationCommand(command)) = interaction.data.as_ref()
+            else {
+                return Vec::new();
+            };
+
+            command
+                .options
+                .iter()
+                .filter_map(|option| {
+                    let CommandOptionValue::Integer(value) = option.value else {
+                        return None;
+                    };
+                    let key = KNOWN.iter().find(|known| **known == option.name)?;
+                    Some((*key, value as i32))
+                })
+                .collect()
+        }
+        CommandSource::Message(_) => {
+            let Some(args) = prefix_args else {
+                return Vec::new();
+            };
+
+            args.split_whitespace()
+                .filter_map(|token| {
+                    let (raw_key, raw_value) = token.split_once(':')?;
+                    let key = KNOWN.iter().find(|known| **known == raw_key)?;
+                    let value: i32 = raw_value.parse().ok()?;
+                    Some((*key, value))
+                })
+                .collect()
+        }
+    }
+}
+
+pub async fn handle(source: &CommandSource<'_>, state: &AppState, prefix_args: Option<&str>) {
+    let Some(guild_id) = source.guild_id() else {
+        source
+            .reply(state, "This command can only be used in a server.")
+            .await;
         return;
     };
 
-    if !invoker_has_manage_guild(interaction) {
-        respond(
-            interaction,
-            state,
-            "You need the **Manage Server** permission to change Blackwall's configuration.",
-        )
-        .await;
+    let permissions = source.invoker_permissions(state).await;
+    if !permissions.contains(Permissions::MANAGE_GUILD)
+        && !permissions.contains(Permissions::ADMINISTRATOR)
+    {
+        source
+            .reply(
+                state,
+                "You need the **Manage Server** permission to change Blackwall's configuration.",
+            )
+            .await;
         return;
     }
 
-    let Some(twilight_model::application::interaction::InteractionData::ApplicationCommand(
-        command,
-    )) = interaction.data.as_ref()
-    else {
-        return;
-    };
-
     let mut applied = Vec::new();
 
-    for option in &command.options {
-        let CommandOptionValue::Integer(value) = option.value else {
-            continue;
-        };
-        let value = value as i32;
-
-        let result = match option.name.as_str() {
+    for (key, value) in parse_args(source, prefix_args) {
+        let result = match key {
             OPT_RAID_BURST => models::set_raid_burst_threshold(&state.db, guild_id, value).await,
             OPT_RAID_SUSPICIOUS => {
                 models::set_raid_suspicious_threshold(&state.db, guild_id, value).await
@@ -155,27 +195,28 @@ pub async fn handle(interaction: &Interaction, state: &AppState) {
         };
 
         match result {
-            Ok(()) => applied.push(option.name.clone()),
-            Err(source) => {
-                tracing::error!(?source, %guild_id, option = %option.name, "failed to save /config threshold");
-                respond(
-                    interaction,
-                    state,
-                    "Blackwall could not save one of those settings. Please try again.",
-                )
-                .await;
+            Ok(()) => applied.push(key),
+            Err(source_err) => {
+                tracing::error!(?source_err, %guild_id, option = key, "failed to save /config threshold");
+                source
+                    .reply(
+                        state,
+                        "Blackwall could not save one of those settings. Please try again.",
+                    )
+                    .await;
                 return;
             }
         }
     }
 
     if applied.is_empty() {
-        respond(
-            interaction,
-            state,
-            "No settings were changed — pass at least one option, e.g. `/config raid-burst:15`.",
-        )
-        .await;
+        source
+            .reply(
+                state,
+                "No settings were changed — pass at least one option, e.g. `/config raid-burst:15` \
+                or `!config raid-burst:15`.",
+            )
+            .await;
         return;
     }
 
@@ -185,12 +226,27 @@ pub async fn handle(interaction: &Interaction, state: &AppState) {
     // fresh values, not to invalidate per-field.
     state.settings_cache.invalidate(guild_id);
 
-    let settings = models::get_guild_settings(&state.db, guild_id).await;
-    let embed = summary_embed(&settings, &applied);
-    respond_with_embed(interaction, state, embed).await;
+    // The full-values summary embed is fine for a slash command's private
+    // reply, but a `!config` prefix confirmation is always a public
+    // channel message — dumping every current threshold there (not just
+    // what changed) would hand a would-be raider a precise readout of
+    // exactly what to stay under. The write itself still happens either
+    // way; only the reply's detail level differs.
+    match source {
+        CommandSource::Interaction(_) => {
+            let settings = models::get_guild_settings(&state.db, guild_id).await;
+            let embed = summary_embed(&settings, &applied);
+            source.reply_with_embed(state, embed).await;
+        }
+        CommandSource::Message(_) => {
+            source
+                .reply(state, &format!("Updated: {}.", applied.join(", ")))
+                .await;
+        }
+    }
 }
 
-fn summary_embed(settings: &models::GuildSettings, applied: &[String]) -> Embed {
+fn summary_embed(settings: &models::GuildSettings, applied: &[&str]) -> Embed {
     EmbedBuilder::new()
         .title("Blackwall configuration updated")
         .color(0x2E_C4_6B)
@@ -228,51 +284,4 @@ fn summary_embed(settings: &models::GuildSettings, applied: &[String]) -> Embed 
             .inline(),
         )
         .build()
-}
-
-fn invoker_has_manage_guild(interaction: &Interaction) -> bool {
-    interaction
-        .member
-        .as_ref()
-        .and_then(|member| member.permissions)
-        .is_some_and(|permissions| {
-            permissions.contains(Permissions::MANAGE_GUILD)
-                || permissions.contains(Permissions::ADMINISTRATOR)
-        })
-}
-
-async fn respond(interaction: &Interaction, state: &AppState, content: &str) {
-    let data = InteractionResponseDataBuilder::new()
-        .content(content)
-        .flags(MessageFlags::EPHEMERAL)
-        .build();
-    send_response(interaction, state, data).await;
-}
-
-async fn respond_with_embed(interaction: &Interaction, state: &AppState, embed: Embed) {
-    let data = InteractionResponseDataBuilder::new()
-        .embeds([embed])
-        .flags(MessageFlags::EPHEMERAL)
-        .build();
-    send_response(interaction, state, data).await;
-}
-
-async fn send_response(
-    interaction: &Interaction,
-    state: &AppState,
-    data: twilight_model::http::interaction::InteractionResponseData,
-) {
-    let response = InteractionResponse {
-        kind: InteractionResponseType::ChannelMessageWithSource,
-        data: Some(data),
-    };
-
-    if let Err(source) = state
-        .http
-        .interaction(state.application_id)
-        .create_response(interaction.id, &interaction.token, &response)
-        .await
-    {
-        tracing::error!(?source, "failed to respond to /config interaction");
-    }
 }

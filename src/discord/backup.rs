@@ -1,13 +1,11 @@
 use serde::{Deserialize, Serialize};
 use twilight_model::application::command::{Command, CommandType};
-use twilight_model::application::interaction::{Interaction, InteractionContextType};
-use twilight_model::channel::message::MessageFlags;
+use twilight_model::application::interaction::InteractionContextType;
 use twilight_model::channel::ChannelType;
 use twilight_model::guild::Permissions;
-use twilight_model::http::interaction::{InteractionResponse, InteractionResponseType};
 use twilight_util::builder::command::CommandBuilder;
-use twilight_util::builder::InteractionResponseDataBuilder;
 
+use crate::discord::source::CommandSource;
 use crate::state::AppState;
 use crate::storage::models;
 
@@ -60,81 +58,60 @@ pub fn commands() -> Vec<Command> {
     ]
 }
 
-pub async fn handle_backup(interaction: &Interaction, state: &AppState) {
-    let Some(guild_id) = interaction.guild_id else {
-        respond(
-            interaction,
-            state,
-            "This command can only be used in a server.",
-        )
-        .await;
+pub async fn handle_backup(source: &CommandSource<'_>, state: &AppState) {
+    let Some(guild_id) = source.guild_id() else {
+        source
+            .reply(state, "This command can only be used in a server.")
+            .await;
         return;
     };
 
-    if !invoker_has_manage_guild(interaction) {
-        respond(
-            interaction,
-            state,
-            "You need the **Manage Server** permission to run `/backup`.",
-        )
-        .await;
+    if !has_manage_guild(source, state).await {
+        source
+            .reply(
+                state,
+                "You need the **Manage Server** permission to run `/backup`.",
+            )
+            .await;
         return;
     }
 
     let Ok(guild_response) = state.http.guild(guild_id).await else {
-        respond(
-            interaction,
-            state,
-            "Couldn't load this server from Discord.",
-        )
-        .await;
+        source
+            .reply(state, "Couldn't load this server from Discord.")
+            .await;
         return;
     };
     let Ok(guild) = guild_response.model().await else {
-        respond(
-            interaction,
-            state,
-            "Discord sent back a server we couldn't read.",
-        )
-        .await;
+        source
+            .reply(state, "Discord sent back a server we couldn't read.")
+            .await;
         return;
     };
 
     let Ok(roles_response) = state.http.roles(guild_id).await else {
-        respond(
-            interaction,
-            state,
-            "Couldn't load this server's roles from Discord.",
-        )
-        .await;
+        source
+            .reply(state, "Couldn't load this server's roles from Discord.")
+            .await;
         return;
     };
     let Ok(roles) = roles_response.model().await else {
-        respond(
-            interaction,
-            state,
-            "Discord sent back roles we couldn't read.",
-        )
-        .await;
+        source
+            .reply(state, "Discord sent back roles we couldn't read.")
+            .await;
         return;
     };
 
     let Ok(channels_response) = state.http.guild_channels(guild_id).await else {
-        respond(
-            interaction,
-            state,
-            "Couldn't load this server's channels from Discord.",
-        )
-        .await;
+        source
+            .reply(state, "Couldn't load this server's channels from Discord.")
+            .await;
         return;
     };
     let Ok(channels) = channels_response.model().await else {
-        respond(
-            interaction,
-            state,
-            "Discord sent back channels we couldn't read.",
-        )
-        .await;
+        source
+            .reply(state, "Discord sent back channels we couldn't read.")
+            .await;
         return;
     };
 
@@ -182,94 +159,79 @@ pub async fn handle_backup(interaction: &Interaction, state: &AppState) {
     let backup_json = serde_json::to_string(&backup).expect("GuildBackup should always serialize");
     models::create_backup(&state.db, guild_id, &backup_json).await;
 
-    respond(
-        interaction,
-        state,
-        &format!("Backed up {role_count} role(s) and {channel_count} channel(s)."),
-    )
-    .await;
-}
-
-pub async fn handle_restore(interaction: &Interaction, state: &AppState) {
-    let Some(guild_id) = interaction.guild_id else {
-        respond(
-            interaction,
+    source
+        .reply(
             state,
-            "This command can only be used in a server.",
+            &format!("Backed up {role_count} role(s) and {channel_count} channel(s)."),
         )
         .await;
+}
+
+pub async fn handle_restore(source: &CommandSource<'_>, state: &AppState) {
+    let Some(guild_id) = source.guild_id() else {
+        source
+            .reply(state, "This command can only be used in a server.")
+            .await;
         return;
     };
 
-    if !invoker_has_manage_guild(interaction) {
-        respond(
-            interaction,
-            state,
-            "You need the **Manage Server** permission to run `/restore`.",
-        )
-        .await;
+    if !has_manage_guild(source, state).await {
+        source
+            .reply(
+                state,
+                "You need the **Manage Server** permission to run `/restore`.",
+            )
+            .await;
         return;
     }
 
     let Some(backup_json) = models::get_latest_backup_json(&state.db, guild_id).await else {
-        respond(
-            interaction,
-            state,
-            "No backup exists yet for this server — run `/backup` first.",
-        )
-        .await;
+        source
+            .reply(
+                state,
+                "No backup exists yet for this server — run `/backup` first.",
+            )
+            .await;
         return;
     };
 
     let backup: GuildBackup = match serde_json::from_str(&backup_json) {
         Ok(backup) => backup,
-        Err(source) => {
-            tracing::error!(?source, %guild_id, "failed to parse stored backup");
-            respond(
-                interaction,
-                state,
-                "The stored backup couldn't be read — please run `/backup` again.",
-            )
-            .await;
+        Err(source_err) => {
+            tracing::error!(?source_err, %guild_id, "failed to parse stored backup");
+            source
+                .reply(
+                    state,
+                    "The stored backup couldn't be read — please run `/backup` again.",
+                )
+                .await;
             return;
         }
     };
 
     let Ok(roles_response) = state.http.roles(guild_id).await else {
-        respond(
-            interaction,
-            state,
-            "Couldn't load this server's roles from Discord.",
-        )
-        .await;
+        source
+            .reply(state, "Couldn't load this server's roles from Discord.")
+            .await;
         return;
     };
     let Ok(current_roles) = roles_response.model().await else {
-        respond(
-            interaction,
-            state,
-            "Discord sent back roles we couldn't read.",
-        )
-        .await;
+        source
+            .reply(state, "Discord sent back roles we couldn't read.")
+            .await;
         return;
     };
 
     let Ok(channels_response) = state.http.guild_channels(guild_id).await else {
-        respond(
-            interaction,
-            state,
-            "Couldn't load this server's channels from Discord.",
-        )
-        .await;
+        source
+            .reply(state, "Couldn't load this server's channels from Discord.")
+            .await;
         return;
     };
     let Ok(current_channels) = channels_response.model().await else {
-        respond(
-            interaction,
-            state,
-            "Discord sent back channels we couldn't read.",
-        )
-        .await;
+        source
+            .reply(state, "Discord sent back channels we couldn't read.")
+            .await;
         return;
     };
 
@@ -295,8 +257,8 @@ pub async fn handle_restore(interaction: &Interaction, state: &AppState) {
 
         match result {
             Ok(_) => roles_recreated += 1,
-            Err(source) => {
-                tracing::error!(?source, %guild_id, role = %role.name, "failed to recreate role during /restore");
+            Err(source_err) => {
+                tracing::error!(?source_err, %guild_id, role = %role.name, "failed to recreate role during /restore");
             }
         }
     }
@@ -325,58 +287,27 @@ pub async fn handle_restore(interaction: &Interaction, state: &AppState) {
 
         match request.await {
             Ok(_) => channels_recreated += 1,
-            Err(source) => {
-                tracing::error!(?source, %guild_id, channel = %channel.name, "failed to recreate channel during /restore");
+            Err(source_err) => {
+                tracing::error!(?source_err, %guild_id, channel = %channel.name, "failed to recreate channel during /restore");
             }
         }
     }
 
-    respond(
-        interaction,
-        state,
-        &format!(
-            "Restore complete. Recreated {roles_recreated} role(s) and {channels_recreated} \
-            channel(s) that were missing.\n\n\
-            Note: recreated roles/channels get **new** Discord IDs — anything that referenced \
-            the old ones (other bots' saved config, permission overwrites) will need manual \
-            reattachment. This is a Discord limitation, not something Blackwall can work around."
-        ),
-    )
-    .await;
-}
-
-fn invoker_has_manage_guild(interaction: &Interaction) -> bool {
-    interaction
-        .member
-        .as_ref()
-        .and_then(|member| member.permissions)
-        .is_some_and(|permissions| {
-            permissions.contains(Permissions::MANAGE_GUILD)
-                || permissions.contains(Permissions::ADMINISTRATOR)
-        })
-}
-
-async fn respond(interaction: &Interaction, state: &AppState, content: &str) {
-    let mut data = InteractionResponseDataBuilder::new()
-        .content(content)
-        .build();
-    data.flags = Some(MessageFlags::EPHEMERAL);
-
-    let response = InteractionResponse {
-        kind: InteractionResponseType::ChannelMessageWithSource,
-        data: Some(data),
-    };
-
-    let result = state
-        .http
-        .interaction(state.application_id)
-        .create_response(interaction.id, &interaction.token, &response)
+    source
+        .reply(
+            state,
+            &format!(
+                "Restore complete. Recreated {roles_recreated} role(s) and {channels_recreated} \
+                channel(s) that were missing.\n\n\
+                Note: recreated roles/channels get **new** Discord IDs — anything that referenced \
+                the old ones (other bots' saved config, permission overwrites) will need manual \
+                reattachment. This is a Discord limitation, not something Blackwall can work around."
+            ),
+        )
         .await;
+}
 
-    if let Err(source) = result {
-        tracing::error!(
-            ?source,
-            "failed to respond to /backup or /restore interaction"
-        );
-    }
+async fn has_manage_guild(source: &CommandSource<'_>, state: &AppState) -> bool {
+    let permissions = source.invoker_permissions(state).await;
+    permissions.contains(Permissions::MANAGE_GUILD) || permissions.contains(Permissions::ADMINISTRATOR)
 }

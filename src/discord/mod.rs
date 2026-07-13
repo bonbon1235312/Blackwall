@@ -11,6 +11,8 @@ pub mod http;
 pub mod interactions;
 pub mod lockdown;
 pub mod moderate;
+pub mod prefix;
 pub mod security_score;
 pub mod setup;
+pub mod source;
 pub mod verify_panel;
