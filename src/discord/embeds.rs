@@ -389,6 +389,35 @@ pub fn nuke_detected(
         .build()
 }
 
+/// Builds the log embed sent for a manual `/ban`, `/kick`, `/timeout`, or
+/// `/warn` command — the staff-triggered counterpart to the automated
+/// detectors' own log embeds above.
+pub fn manual_moderation_action(
+    action_label: &str,
+    target_id: Id<UserMarker>,
+    moderator_id: Option<Id<UserMarker>>,
+    reason: Option<&str>,
+    succeeded: bool,
+    outcome_label: &str,
+) -> Embed {
+    EmbedBuilder::new()
+        .title(format!("{action_label} — manual moderation action"))
+        .color(if succeeded { COLOR_SUCCESS } else { COLOR_DANGER })
+        .field(EmbedFieldBuilder::new("Target", format!("<@{target_id}>")).inline())
+        .field(
+            EmbedFieldBuilder::new(
+                "Moderator",
+                moderator_id
+                    .map(|id| format!("<@{id}>"))
+                    .unwrap_or_else(|| "Unknown".to_string()),
+            )
+            .inline(),
+        )
+        .field(EmbedFieldBuilder::new("Reason", reason.unwrap_or("No reason given")))
+        .field(EmbedFieldBuilder::new("Outcome", outcome_label))
+        .build()
+}
+
 /// Builds the log embed sent when the trusted-role bot-add gate reacts to
 /// a bot/app added by someone without the configured trusted role.
 pub fn unauthorized_bot_add(actor_id: Id<UserMarker>, bot_kicked: bool, roles_removed: usize) -> Embed {

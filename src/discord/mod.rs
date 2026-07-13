@@ -10,6 +10,7 @@ pub mod embeds;
 pub mod http;
 pub mod interactions;
 pub mod lockdown;
+pub mod moderate;
 pub mod security_score;
 pub mod setup;
 pub mod verify_panel;
