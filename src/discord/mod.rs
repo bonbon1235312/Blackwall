@@ -5,6 +5,7 @@
 
 pub mod backup;
 pub mod commands;
+pub mod config;
 pub mod embeds;
 pub mod http;
 pub mod interactions;

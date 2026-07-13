@@ -7,15 +7,13 @@ use crate::storage::models::{self, GuildSettings};
 /// Caches `guild_settings` in memory so the message-handling hot path —
 /// checked on every single message, join, and audit-log entry — never
 /// makes a network round-trip to Supabase just to read a handful of
-/// booleans that almost never change.
+/// booleans and thresholds that almost never change.
 ///
-/// Populated lazily on first read per guild. Nothing currently writes to
-/// `guild_settings` after its first-time creation by
-/// `upsert_guild_config` (that doesn't need an invalidation either, since
-/// a freshly-created row's values are exactly what `get_guild_settings`
-/// already falls back to for a missing row) — if a future `/config`-style
-/// command adds a way to flip these toggles, that's the point to add an
-/// `invalidate(guild_id)` method back here.
+/// Populated lazily on first read per guild. `/config` (`discord::config`)
+/// is the only thing that writes to `guild_settings` after its first-time
+/// creation by `upsert_guild_config`, and it calls `invalidate` right
+/// after every successful write, so a changed threshold is never served
+/// stale.
 #[derive(Default)]
 pub struct SettingsCache {
     entries: DashMap<Id<GuildMarker>, GuildSettings>,
@@ -34,5 +32,12 @@ impl SettingsCache {
         let settings = models::get_guild_settings(pool, guild_id).await;
         self.entries.insert(guild_id, settings.clone());
         settings
+    }
+
+    /// Drops a guild's cached settings so the next `get` re-reads from
+    /// Postgres. Call this right after any write to that guild's
+    /// `guild_settings` row.
+    pub fn invalidate(&self, guild_id: Id<GuildMarker>) {
+        self.entries.remove(&guild_id);
     }
 }

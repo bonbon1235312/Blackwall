@@ -8,7 +8,7 @@ use twilight_model::{
 };
 use twilight_util::builder::command::CommandBuilder;
 
-use crate::discord::{backup, lockdown, security_score, setup, verify_panel};
+use crate::discord::{backup, config, lockdown, security_score, setup, verify_panel};
 
 /// Asks Discord which application this bot's token belongs to.
 ///
@@ -44,6 +44,7 @@ fn build_commands() -> Vec<Command> {
         setup::command(),
         verify_panel::command(),
         security_score::command(),
+        config::command(),
     ];
 
     commands.extend(lockdown::commands());

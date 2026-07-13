@@ -47,6 +47,21 @@ pub fn scam_message_deleted(message: &Message, scam_match: &ScamMatch) -> Embed 
         .build()
 }
 
+/// Builds the log embed sent when a message is deleted for containing a
+/// Discord invite link from a user without the trusted role.
+pub fn invite_link_deleted(message: &Message) -> Embed {
+    EmbedBuilder::new()
+        .title("Message deleted — invite link detected")
+        .color(COLOR_DANGER)
+        .field(EmbedFieldBuilder::new("User", format!("<@{}>", message.author.id)).inline())
+        .field(EmbedFieldBuilder::new("Channel", format!("<#{}>", message.channel_id)).inline())
+        .field(EmbedFieldBuilder::new(
+            "Original message",
+            truncate(&message.content, 1000),
+        ))
+        .build()
+}
+
 /// Builds the log embed sent when a message trips the anti-spam filter.
 ///
 /// `timed_out` and `is_owner` let this be honest about what actually
@@ -164,9 +179,23 @@ pub fn setup_panel(
             )
             .inline(),
         )
+        .field(
+            EmbedFieldBuilder::new(
+                "Trusted role",
+                config
+                    .and_then(|config| config.trusted_role_id)
+                    .map(|id| format!("<@&{id}>"))
+                    .unwrap_or_else(|| {
+                        "Not configured — bot-add gate and invite filtering exempt no one yet"
+                            .to_string()
+                    }),
+            )
+            .inline(),
+        )
         .field(EmbedFieldBuilder::new(
             "Active protections",
-            "- Anti-scam and anti-spam\n- Anti-raid lockdown\n- Anti-nuke response",
+            "- Anti-scam, anti-spam, and anti-invite\n- Anti-raid lockdown\n- Anti-nuke response\n\
+            - Bot-add gate (needs a trusted role)",
         ))
         .field(EmbedFieldBuilder::new("Quick check", warnings_text))
         .build()
@@ -357,6 +386,26 @@ pub fn nuke_detected(
                 if quarantined { "yes" } else { "no (no quarantine role configured — run /setup)" }
             ),
         ))
+        .build()
+}
+
+/// Builds the log embed sent when the trusted-role bot-add gate reacts to
+/// a bot/app added by someone without the configured trusted role.
+pub fn unauthorized_bot_add(actor_id: Id<UserMarker>, bot_kicked: bool, roles_removed: usize) -> Embed {
+    EmbedBuilder::new()
+        .title("Unauthorized bot add")
+        .color(COLOR_DANGER)
+        .field(EmbedFieldBuilder::new("Added by", format!("<@{actor_id}>")).inline())
+        .field(
+            EmbedFieldBuilder::new(
+                "Response",
+                format!(
+                    "Bot removed: {}. Stripped {roles_removed} dangerous role(s) from the \
+                    adding user.",
+                    if bot_kicked { "yes" } else { "no — check the bot's Kick Members permission" }
+                ),
+            ),
+        )
         .build()
 }
 

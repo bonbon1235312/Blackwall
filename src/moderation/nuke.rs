@@ -6,12 +6,11 @@ use twilight_model::guild::audit_log::AuditLogEventType;
 use twilight_model::id::Id;
 use twilight_model::id::marker::{GuildMarker, UserMarker};
 
-/// How far back dangerous-action history is kept per (guild, actor).
+/// How far back dangerous-action history is kept per (guild, actor). Not
+/// configurable — `/config` exposes the action-count threshold
+/// (`guild_settings.nuke_burst_threshold`, defaulted in
+/// `storage::models::get_guild_settings`), not this window.
 const WINDOW: Duration = Duration::from_secs(30);
-
-/// This many dangerous actions by the same actor within `WINDOW` counts as
-/// a nuke attempt.
-const THRESHOLD: usize = 3;
 
 /// Which audit-log event types are dangerous enough to count toward the
 /// nuke threshold. Deliberately a fixed list, not "anything in the audit
@@ -71,6 +70,7 @@ impl NukeTracker {
         guild_id: Id<GuildMarker>,
         actor_id: Id<UserMarker>,
         action_type: AuditLogEventType,
+        threshold: usize,
     ) -> Option<NukeViolation> {
         if !is_dangerous(action_type) {
             return None;
@@ -89,7 +89,7 @@ impl NukeTracker {
 
         history.push_back(ActionEvent { at: now });
 
-        if history.len() >= THRESHOLD {
+        if history.len() >= threshold {
             Some(NukeViolation {
                 count: history.len(),
             })

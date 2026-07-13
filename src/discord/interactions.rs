@@ -2,7 +2,7 @@ use twilight_model::application::interaction::{Interaction, InteractionData};
 use twilight_model::http::interaction::{InteractionResponse, InteractionResponseType};
 use twilight_util::builder::InteractionResponseDataBuilder;
 
-use crate::discord::{backup, lockdown, security_score, setup, verify_panel};
+use crate::discord::{backup, config, lockdown, security_score, setup, verify_panel};
 use crate::state::AppState;
 
 /// Handles a single interaction: slash commands and the setup panel's
@@ -23,6 +23,7 @@ pub async fn handle(interaction: Interaction, state: &AppState) {
             "security-score" => security_score::handle(&interaction, state).await,
             "backup" => backup::handle_backup(&interaction, state).await,
             "restore" => backup::handle_restore(&interaction, state).await,
+            "config" => config::handle(&interaction, state).await,
             other => tracing::warn!(command = other, "received unknown slash command"),
         },
         Some(InteractionData::MessageComponent(component))

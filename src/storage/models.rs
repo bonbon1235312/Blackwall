@@ -13,6 +13,11 @@ pub struct GuildConfig {
     pub log_channel_id: Option<Id<ChannelMarker>>,
     pub verified_role_id: Option<Id<RoleMarker>>,
     pub quarantine_role_id: Option<Id<RoleMarker>>,
+    /// Exempts a member from the bot-add gate (`gateway`'s `BotAdd`
+    /// handling) and invite-link deletion (`moderation::invite`). `None`
+    /// means neither feature has anyone to exempt yet, not that they're
+    /// disabled — see each feature's own check.
+    pub trusted_role_id: Option<Id<RoleMarker>>,
 }
 
 /// Creates or updates a guild's configuration, and makes sure a
@@ -23,19 +28,21 @@ pub struct GuildConfig {
 /// the setup panel cannot silently undo a setting an admin already changed.
 pub async fn upsert_guild_config(pool: &PgPool, config: &GuildConfig) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO guilds (guild_id, owner_id, log_channel_id, verified_role_id, quarantine_role_id)
-         VALUES ($1, $2, $3, $4, $5)
+        "INSERT INTO guilds (guild_id, owner_id, log_channel_id, verified_role_id, quarantine_role_id, trusted_role_id)
+         VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (guild_id) DO UPDATE SET
             owner_id = excluded.owner_id,
             log_channel_id = excluded.log_channel_id,
             verified_role_id = excluded.verified_role_id,
-            quarantine_role_id = excluded.quarantine_role_id",
+            quarantine_role_id = excluded.quarantine_role_id,
+            trusted_role_id = excluded.trusted_role_id",
     )
     .bind(config.guild_id.to_string())
     .bind(config.owner_id.to_string())
     .bind(config.log_channel_id.map(|id| id.to_string()))
     .bind(config.verified_role_id.map(|id| id.to_string()))
     .bind(config.quarantine_role_id.map(|id| id.to_string()))
+    .bind(config.trusted_role_id.map(|id| id.to_string()))
     .execute(pool)
     .await?;
 
@@ -52,7 +59,7 @@ pub async fn upsert_guild_config(pool: &PgPool, config: &GuildConfig) -> Result<
 /// Looks up a guild's saved setup choices, if it has been initialized.
 pub async fn get_guild_config(pool: &PgPool, guild_id: Id<GuildMarker>) -> Option<GuildConfig> {
     let row = sqlx::query(
-        "SELECT owner_id, log_channel_id, verified_role_id, quarantine_role_id
+        "SELECT owner_id, log_channel_id, verified_role_id, quarantine_role_id, trusted_role_id
          FROM guilds WHERE guild_id = $1",
     )
     .bind(guild_id.to_string())
@@ -72,6 +79,9 @@ pub async fn get_guild_config(pool: &PgPool, guild_id: Id<GuildMarker>) -> Optio
     let quarantine_role_id: Option<String> = row
         .try_get("quarantine_role_id")
         .expect("guilds.quarantine_role_id column missing or the wrong type");
+    let trusted_role_id: Option<String> = row
+        .try_get("trusted_role_id")
+        .expect("guilds.trusted_role_id column missing or the wrong type");
 
     Some(GuildConfig {
         guild_id,
@@ -89,6 +99,10 @@ pub async fn get_guild_config(pool: &PgPool, guild_id: Id<GuildMarker>) -> Optio
         quarantine_role_id: quarantine_role_id.map(|raw| {
             raw.parse()
                 .expect("quarantine_role_id stored in the database was not a valid Discord ID")
+        }),
+        trusted_role_id: trusted_role_id.map(|raw| {
+            raw.parse()
+                .expect("trusted_role_id stored in the database was not a valid Discord ID")
         }),
     })
 }
@@ -138,10 +152,51 @@ pub async fn set_quarantine_role_id(
     Ok(())
 }
 
-/// A guild's feature toggles, mirroring a row in the `guild_settings`
-/// table. Only the fields something actually reads are included here —
-/// the rest of the columns get their own field once the feature that uses
-/// them exists (verification).
+/// Updates the role that exempts a member from the bot-add gate and
+/// invite-link deletion.
+pub async fn set_trusted_role_id(
+    pool: &PgPool,
+    guild_id: Id<GuildMarker>,
+    role_id: Id<RoleMarker>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE guilds SET trusted_role_id = $1 WHERE guild_id = $2")
+        .bind(role_id.to_string())
+        .bind(guild_id.to_string())
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}
+
+/// Looks up the role configured by `/setup` to exempt a member from the
+/// bot-add gate and invite-link deletion. `None` means no trusted role has
+/// been configured — both features treat that as "nothing to exempt yet,"
+/// not "feature disabled."
+pub async fn get_trusted_role_id(
+    pool: &PgPool,
+    guild_id: Id<GuildMarker>,
+) -> Option<Id<RoleMarker>> {
+    let row = sqlx::query("SELECT trusted_role_id FROM guilds WHERE guild_id = $1")
+        .bind(guild_id.to_string())
+        .fetch_optional(pool)
+        .await
+        .expect("failed to look up a guild's trusted role")?;
+
+    let raw: Option<String> = row
+        .try_get("trusted_role_id")
+        .expect("guilds.trusted_role_id column missing or the wrong type");
+
+    raw.map(|raw| {
+        raw.parse()
+            .expect("trusted_role_id stored in the database was not a valid Discord ID")
+    })
+}
+
+/// A guild's feature toggles and configurable detection thresholds,
+/// mirroring a row in the `guild_settings` table. Only the fields
+/// something actually reads are included here — the rest of the columns
+/// get their own field once the feature that uses them exists
+/// (verification).
 ///
 /// `Clone` is needed by `storage::cache::SettingsCache`, which hands back
 /// an owned copy from its in-memory cache rather than a reference.
@@ -151,6 +206,24 @@ pub struct GuildSettings {
     pub anti_scam_enabled: bool,
     pub anti_raid_enabled: bool,
     pub anti_nuke_enabled: bool,
+    pub anti_invite_enabled: bool,
+    /// This many joins within the anti-raid window counts as a raid-scale
+    /// burst on its own. See `moderation::raid`.
+    pub raid_burst_threshold: i32,
+    /// This many individually-suspicious joins within the window counts
+    /// as a raid even below the burst threshold.
+    pub raid_suspicious_threshold: i32,
+    /// This many dangerous audit-log actions by the same actor within 30
+    /// seconds counts as a nuke attempt. See `moderation::nuke`.
+    pub nuke_burst_threshold: i32,
+    /// This many messages within the anti-spam window counts as a burst.
+    pub spam_burst_threshold: i32,
+    /// This many identical messages in a row counts as copy-paste spam.
+    pub spam_repeat_threshold: i32,
+    /// This many mentions in a single message counts as mention spam.
+    pub spam_mention_threshold: i32,
+    pub spam_timeout_minutes: i32,
+    pub raid_timeout_minutes: i32,
 }
 
 /// Looks up a guild's feature toggles.
@@ -165,7 +238,10 @@ pub struct GuildSettings {
 /// cache falls back to on a miss.
 pub async fn get_guild_settings(pool: &PgPool, guild_id: Id<GuildMarker>) -> GuildSettings {
     let row = sqlx::query(
-        "SELECT anti_spam_enabled, anti_scam_enabled, anti_raid_enabled, anti_nuke_enabled
+        "SELECT anti_spam_enabled, anti_scam_enabled, anti_raid_enabled, anti_nuke_enabled,
+                anti_invite_enabled, raid_burst_threshold, raid_suspicious_threshold,
+                nuke_burst_threshold, spam_burst_threshold, spam_repeat_threshold,
+                spam_mention_threshold, spam_timeout_minutes, raid_timeout_minutes
          FROM guild_settings WHERE guild_id = $1",
     )
     .bind(guild_id.to_string())
@@ -173,12 +249,24 @@ pub async fn get_guild_settings(pool: &PgPool, guild_id: Id<GuildMarker>) -> Gui
     .await
     .expect("failed to look up guild settings");
 
+    // Defaults here must match `guild_settings`' own column defaults in
+    // schema.sql: a guild with no row yet (hasn't run /setup) gets exactly
+    // what a freshly-created row would have.
     let Some(row) = row else {
         return GuildSettings {
             anti_spam_enabled: true,
             anti_scam_enabled: true,
             anti_raid_enabled: true,
             anti_nuke_enabled: true,
+            anti_invite_enabled: true,
+            raid_burst_threshold: 10,
+            raid_suspicious_threshold: 5,
+            nuke_burst_threshold: 3,
+            spam_burst_threshold: 6,
+            spam_repeat_threshold: 3,
+            spam_mention_threshold: 5,
+            spam_timeout_minutes: 10,
+            raid_timeout_minutes: 1440,
         };
     };
 
@@ -195,7 +283,118 @@ pub async fn get_guild_settings(pool: &PgPool, guild_id: Id<GuildMarker>) -> Gui
         anti_nuke_enabled: row
             .try_get("anti_nuke_enabled")
             .expect("guild_settings.anti_nuke_enabled column missing or the wrong type"),
+        anti_invite_enabled: row
+            .try_get("anti_invite_enabled")
+            .expect("guild_settings.anti_invite_enabled column missing or the wrong type"),
+        raid_burst_threshold: row
+            .try_get("raid_burst_threshold")
+            .expect("guild_settings.raid_burst_threshold column missing or the wrong type"),
+        raid_suspicious_threshold: row
+            .try_get("raid_suspicious_threshold")
+            .expect("guild_settings.raid_suspicious_threshold column missing or the wrong type"),
+        nuke_burst_threshold: row
+            .try_get("nuke_burst_threshold")
+            .expect("guild_settings.nuke_burst_threshold column missing or the wrong type"),
+        spam_burst_threshold: row
+            .try_get("spam_burst_threshold")
+            .expect("guild_settings.spam_burst_threshold column missing or the wrong type"),
+        spam_repeat_threshold: row
+            .try_get("spam_repeat_threshold")
+            .expect("guild_settings.spam_repeat_threshold column missing or the wrong type"),
+        spam_mention_threshold: row
+            .try_get("spam_mention_threshold")
+            .expect("guild_settings.spam_mention_threshold column missing or the wrong type"),
+        spam_timeout_minutes: row
+            .try_get("spam_timeout_minutes")
+            .expect("guild_settings.spam_timeout_minutes column missing or the wrong type"),
+        raid_timeout_minutes: row
+            .try_get("raid_timeout_minutes")
+            .expect("guild_settings.raid_timeout_minutes column missing or the wrong type"),
     }
+}
+
+/// Updates one of a guild's configurable detection thresholds. Used by
+/// `/config` — `field` must be a literal column name from `guild_settings`
+/// (never user input) since it's interpolated into the query rather than
+/// bound, which sqlx's query builder doesn't support for column names.
+async fn set_threshold(
+    pool: &PgPool,
+    guild_id: Id<GuildMarker>,
+    field: &'static str,
+    value: i32,
+) -> Result<(), sqlx::Error> {
+    let query = format!("UPDATE guild_settings SET {field} = $1 WHERE guild_id = $2");
+    sqlx::query(&query)
+        .bind(value)
+        .bind(guild_id.to_string())
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}
+
+pub async fn set_raid_burst_threshold(
+    pool: &PgPool,
+    guild_id: Id<GuildMarker>,
+    value: i32,
+) -> Result<(), sqlx::Error> {
+    set_threshold(pool, guild_id, "raid_burst_threshold", value).await
+}
+
+pub async fn set_raid_suspicious_threshold(
+    pool: &PgPool,
+    guild_id: Id<GuildMarker>,
+    value: i32,
+) -> Result<(), sqlx::Error> {
+    set_threshold(pool, guild_id, "raid_suspicious_threshold", value).await
+}
+
+pub async fn set_nuke_burst_threshold(
+    pool: &PgPool,
+    guild_id: Id<GuildMarker>,
+    value: i32,
+) -> Result<(), sqlx::Error> {
+    set_threshold(pool, guild_id, "nuke_burst_threshold", value).await
+}
+
+pub async fn set_spam_burst_threshold(
+    pool: &PgPool,
+    guild_id: Id<GuildMarker>,
+    value: i32,
+) -> Result<(), sqlx::Error> {
+    set_threshold(pool, guild_id, "spam_burst_threshold", value).await
+}
+
+pub async fn set_spam_repeat_threshold(
+    pool: &PgPool,
+    guild_id: Id<GuildMarker>,
+    value: i32,
+) -> Result<(), sqlx::Error> {
+    set_threshold(pool, guild_id, "spam_repeat_threshold", value).await
+}
+
+pub async fn set_spam_mention_threshold(
+    pool: &PgPool,
+    guild_id: Id<GuildMarker>,
+    value: i32,
+) -> Result<(), sqlx::Error> {
+    set_threshold(pool, guild_id, "spam_mention_threshold", value).await
+}
+
+pub async fn set_spam_timeout_minutes(
+    pool: &PgPool,
+    guild_id: Id<GuildMarker>,
+    value: i32,
+) -> Result<(), sqlx::Error> {
+    set_threshold(pool, guild_id, "spam_timeout_minutes", value).await
+}
+
+pub async fn set_raid_timeout_minutes(
+    pool: &PgPool,
+    guild_id: Id<GuildMarker>,
+    value: i32,
+) -> Result<(), sqlx::Error> {
+    set_threshold(pool, guild_id, "raid_timeout_minutes", value).await
 }
 
 /// Looks up where a guild's moderation logs should be sent, if configured.

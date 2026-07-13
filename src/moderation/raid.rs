@@ -11,23 +11,21 @@ use crate::utils::ids::snowflake_created_at;
 
 /// How far back join history is kept per guild. Raids unfold over a
 /// somewhat longer timescale than a single message-spam burst, hence the
-/// longer window than `moderation::spam`'s 10 seconds.
+/// longer window than `moderation::spam`'s 10 seconds. Not configurable —
+/// `/config` exposes the count thresholds below, not the window itself.
 const WINDOW: Duration = Duration::from_secs(60);
 
-/// This many joins within `WINDOW` counts as a raid-scale burst on its own,
-/// regardless of how "normal" any individual joiner looks.
-const BURST_THRESHOLD: usize = 10;
+/// Fallback burst/suspicious thresholds for a guild with no `guild_settings`
+/// row yet — must match `guild_settings.raid_burst_threshold` /
+/// `raid_suspicious_threshold`'s own column defaults in schema.sql, and
+/// what the `#[cfg(test)]` module below exercises.
+pub const DEFAULT_BURST_THRESHOLD: usize = 10;
+pub const DEFAULT_SUSPICIOUS_ACCOUNT_THRESHOLD: usize = 5;
 
 /// An account created less than this long ago is treated as suspiciously
 /// new for the purposes of anti-raid (separately from Stage 5/6's
 /// verification flow, which is about identity, not account age).
 const NEW_ACCOUNT_THRESHOLD: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-
-/// If at least this many of the joins currently in the window are
-/// individually suspicious (new account and/or no avatar), that's treated
-/// as a raid even if the raw join count hasn't hit `BURST_THRESHOLD` yet —
-/// that combination is a stronger signal than volume alone.
-const SUSPICIOUS_ACCOUNT_THRESHOLD: usize = 5;
 
 /// Hard memory bound for one guild's rolling join window. Detection trips
 /// long before this limit, so retaining more records would only make a raid
@@ -39,11 +37,30 @@ const MAX_TRACKED_JOINS: usize = 1_000;
 /// every join and amplifying an outage.
 const INCIDENT_RETRY_DELAY: Duration = Duration::from_secs(10);
 
-/// How long a suspicious joiner is timed out for when a raid is detected.
-/// Longer than a spam timeout (`moderation::spam::TIMEOUT_DURATION`)
-/// deliberately: a raid is a much stronger signal of bad intent than a
-/// single spam burst, and staff need real time to review before it lapses.
-pub const RAID_TIMEOUT_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
+/// Fallback raid-response timeout duration for a guild with no
+/// `guild_settings` row yet — must match
+/// `guild_settings.raid_timeout_minutes`'s own column default.
+pub const DEFAULT_RAID_TIMEOUT_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The per-guild thresholds `/config` can adjust, read from `GuildSettings`
+/// at the call site and passed in by value — small and `Copy`, so this adds
+/// no allocation to the hot path `record` runs on.
+#[derive(Clone, Copy)]
+pub struct RaidThresholds {
+    pub burst_threshold: usize,
+    pub suspicious_threshold: usize,
+    pub timeout: Duration,
+}
+
+impl Default for RaidThresholds {
+    fn default() -> Self {
+        Self {
+            burst_threshold: DEFAULT_BURST_THRESHOLD,
+            suspicious_threshold: DEFAULT_SUSPICIOUS_ACCOUNT_THRESHOLD,
+            timeout: DEFAULT_RAID_TIMEOUT_DURATION,
+        }
+    }
+}
 
 /// One join, as recorded for the anti-raid window.
 #[derive(Clone)]
@@ -115,15 +132,15 @@ impl RaidViolation {
 }
 
 /// The point in time a raid-response timeout applied right now should
-/// end. Same shape as `moderation::spam::timeout_until`, just with the
-/// longer `RAID_TIMEOUT_DURATION`.
-pub fn raid_timeout_until() -> Timestamp {
+/// end. Same shape as `moderation::spam::timeout_until`, just with a
+/// guild-configurable duration instead of a fixed constant.
+pub fn raid_timeout_until(timeout: Duration) -> Timestamp {
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock is set before 1970")
         .as_secs();
 
-    let until_secs = now_secs + RAID_TIMEOUT_DURATION.as_secs();
+    let until_secs = now_secs + timeout.as_secs();
 
     Timestamp::from_secs(until_secs as i64)
         .expect("computed raid timeout timestamp was outside Discord's valid range")
@@ -149,7 +166,12 @@ impl JoinTracker {
     /// looks like a raid. A guild emits one incident while either threshold
     /// remains active, preventing every subsequent join from launching the
     /// same expensive lockdown response again.
-    pub fn record(&self, guild_id: Id<GuildMarker>, member: &Member) -> RaidCheck {
+    pub fn record(
+        &self,
+        guild_id: Id<GuildMarker>,
+        member: &Member,
+        thresholds: RaidThresholds,
+    ) -> RaidCheck {
         let account_created_at = snowflake_created_at(member.user.id);
         let now_unix_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -193,8 +215,8 @@ impl JoinTracker {
             state.retry_after = None;
         }
 
-        if state.events.len() < BURST_THRESHOLD
-            && state.suspicious_count < SUSPICIOUS_ACCOUNT_THRESHOLD
+        if state.events.len() < thresholds.burst_threshold
+            && state.suspicious_count < thresholds.suspicious_threshold
         {
             state.incident_active = false;
             state.retry_after = None;
@@ -218,11 +240,11 @@ impl JoinTracker {
             record: record.clone(),
         });
 
-        let violation = if state.events.len() >= BURST_THRESHOLD {
+        let violation = if state.events.len() >= thresholds.burst_threshold {
             Some(RaidViolation::JoinBurst {
                 count: state.events.len(),
             })
-        } else if state.suspicious_count >= SUSPICIOUS_ACCOUNT_THRESHOLD {
+        } else if state.suspicious_count >= thresholds.suspicious_threshold {
             Some(RaidViolation::SuspiciousAccounts {
                 count: state.suspicious_count,
             })
@@ -310,27 +332,28 @@ mod tests {
         let tracker = JoinTracker::new();
         let guild_id = Id::new(1);
         let member = member(true);
+        let thresholds = RaidThresholds::default();
 
-        for _ in 0..BURST_THRESHOLD - 1 {
-            let check = tracker.record(guild_id, &member);
+        for _ in 0..thresholds.burst_threshold - 1 {
+            let check = tracker.record(guild_id, &member, thresholds);
             assert!(!check.raid_active);
             assert!(check.incident.is_none());
         }
 
         let incident = tracker
-            .record(guild_id, &member)
+            .record(guild_id, &member, thresholds)
             .incident
             .expect("the tenth join must trigger a burst incident");
         assert!(matches!(
             incident.violation,
             RaidViolation::JoinBurst {
-                count: BURST_THRESHOLD
+                count: DEFAULT_BURST_THRESHOLD
             }
         ));
-        assert_eq!(incident.window.len(), BURST_THRESHOLD);
+        assert_eq!(incident.window.len(), DEFAULT_BURST_THRESHOLD);
 
         for _ in 0..100 {
-            let check = tracker.record(guild_id, &member);
+            let check = tracker.record(guild_id, &member, thresholds);
             assert!(check.raid_active);
             assert!(check.incident.is_none());
         }
@@ -341,21 +364,22 @@ mod tests {
         let tracker = JoinTracker::new();
         let guild_id = Id::new(2);
         let member = member(false);
+        let thresholds = RaidThresholds::default();
 
-        for _ in 0..SUSPICIOUS_ACCOUNT_THRESHOLD - 1 {
-            let check = tracker.record(guild_id, &member);
+        for _ in 0..thresholds.suspicious_threshold - 1 {
+            let check = tracker.record(guild_id, &member, thresholds);
             assert!(!check.raid_active);
             assert!(check.incident.is_none());
         }
 
         let incident = tracker
-            .record(guild_id, &member)
+            .record(guild_id, &member, thresholds)
             .incident
             .expect("the fifth suspicious join must trigger an incident");
         assert!(matches!(
             incident.violation,
             RaidViolation::SuspiciousAccounts {
-                count: SUSPICIOUS_ACCOUNT_THRESHOLD
+                count: DEFAULT_SUSPICIOUS_ACCOUNT_THRESHOLD
             }
         ));
     }
@@ -365,13 +389,19 @@ mod tests {
         let tracker = JoinTracker::new();
         let guild_id = Id::new(4);
         let member = member(true);
+        let thresholds = RaidThresholds::default();
 
-        for _ in 0..BURST_THRESHOLD {
-            black_box(tracker.record(guild_id, &member));
+        for _ in 0..thresholds.burst_threshold {
+            black_box(tracker.record(guild_id, &member, thresholds));
         }
 
         tracker.schedule_incident_retry(guild_id);
-        assert!(tracker.record(guild_id, &member).incident.is_none());
+        assert!(
+            tracker
+                .record(guild_id, &member, thresholds)
+                .incident
+                .is_none()
+        );
 
         {
             let mut state = tracker
@@ -381,7 +411,7 @@ mod tests {
             state.retry_after = Some(Instant::now() - Duration::from_millis(1));
         }
 
-        let retry = tracker.record(guild_id, &member);
+        let retry = tracker.record(guild_id, &member, thresholds);
         assert!(retry.raid_active);
         assert!(retry.incident.is_some());
     }
@@ -391,9 +421,10 @@ mod tests {
         let tracker = JoinTracker::new();
         let guild_id = Id::new(3);
         let member = member(true);
+        let thresholds = RaidThresholds::default();
 
         for _ in 0..MAX_TRACKED_JOINS + 500 {
-            black_box(tracker.record(guild_id, &member));
+            black_box(tracker.record(guild_id, &member, thresholds));
         }
 
         let state = tracker
@@ -437,13 +468,14 @@ mod tests {
 
         let normal_member = member(true);
         let suspicious_member = member(false);
+        let thresholds = RaidThresholds::default();
 
         let cold_tracker = JoinTracker::new();
         let mut cold_samples = Vec::with_capacity(SAMPLE_COUNT);
         for index in 0..SAMPLE_COUNT {
             let guild_id = Id::new(10_000 + index as u64);
             let started = Instant::now();
-            black_box(cold_tracker.record(guild_id, &normal_member));
+            black_box(cold_tracker.record(guild_id, &normal_member, thresholds));
             cold_samples.push(elapsed_ns(started));
         }
 
@@ -451,11 +483,11 @@ mod tests {
         let mut burst_samples = Vec::with_capacity(SAMPLE_COUNT);
         for index in 0..SAMPLE_COUNT {
             let guild_id = Id::new(20_000 + index as u64);
-            for _ in 0..BURST_THRESHOLD - 1 {
-                black_box(burst_tracker.record(guild_id, &normal_member));
+            for _ in 0..thresholds.burst_threshold - 1 {
+                black_box(burst_tracker.record(guild_id, &normal_member, thresholds));
             }
             let started = Instant::now();
-            black_box(burst_tracker.record(guild_id, &normal_member));
+            black_box(burst_tracker.record(guild_id, &normal_member, thresholds));
             burst_samples.push(elapsed_ns(started));
         }
 
@@ -463,23 +495,23 @@ mod tests {
         let mut suspicious_samples = Vec::with_capacity(SAMPLE_COUNT);
         for index in 0..SAMPLE_COUNT {
             let guild_id = Id::new(30_000 + index as u64);
-            for _ in 0..SUSPICIOUS_ACCOUNT_THRESHOLD - 1 {
-                black_box(suspicious_tracker.record(guild_id, &suspicious_member));
+            for _ in 0..thresholds.suspicious_threshold - 1 {
+                black_box(suspicious_tracker.record(guild_id, &suspicious_member, thresholds));
             }
             let started = Instant::now();
-            black_box(suspicious_tracker.record(guild_id, &suspicious_member));
+            black_box(suspicious_tracker.record(guild_id, &suspicious_member, thresholds));
             suspicious_samples.push(elapsed_ns(started));
         }
 
         let saturated_tracker = JoinTracker::new();
         let saturated_guild_id = Id::new(40_000);
         for _ in 0..MAX_TRACKED_JOINS {
-            black_box(saturated_tracker.record(saturated_guild_id, &normal_member));
+            black_box(saturated_tracker.record(saturated_guild_id, &normal_member, thresholds));
         }
         let mut saturated_samples = Vec::with_capacity(SAMPLE_COUNT);
         for _ in 0..SAMPLE_COUNT {
             let started = Instant::now();
-            black_box(saturated_tracker.record(saturated_guild_id, &normal_member));
+            black_box(saturated_tracker.record(saturated_guild_id, &normal_member, thresholds));
             saturated_samples.push(elapsed_ns(started));
         }
 

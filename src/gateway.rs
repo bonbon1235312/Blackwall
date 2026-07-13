@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use twilight_gateway::{
     Config as GatewayConfig, Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt as _,
@@ -10,6 +10,7 @@ use twilight_model::id::Id;
 
 use crate::actions::lockdown;
 use crate::discord::{embeds, interactions};
+use crate::moderation::invite;
 use crate::moderation::nuke::NukeViolation;
 use crate::moderation::permissions;
 use crate::moderation::raid::{self, RaidViolation};
@@ -105,17 +106,50 @@ async fn handle_event(event: Event, state: Arc<AppState>) {
                 }
             }
 
+            // Cheap in-memory check first (no invite link in most
+            // messages), so the trusted-role DB lookup below only ever
+            // runs on an actual candidate match, not on every message.
+            if settings.anti_invite_enabled && invite::is_invite_link(&message.content) {
+                let is_trusted = models::get_trusted_role_id(&state.db, guild_id)
+                    .await
+                    .is_some_and(|trusted_role_id| {
+                        message
+                            .member
+                            .as_ref()
+                            .is_some_and(|member| member.roles.contains(&trusted_role_id))
+                    });
+
+                if !is_trusted {
+                    handle_invite_link(&state, &message, guild_id).await;
+                    return;
+                }
+            }
+
             if settings.anti_spam_enabled {
                 let mention_count = message.mentions.len();
+                let spam_thresholds = spam::SpamThresholds {
+                    burst_threshold: settings.spam_burst_threshold as usize,
+                    repeat_threshold: settings.spam_repeat_threshold as usize,
+                    mention_threshold: settings.spam_mention_threshold as usize,
+                    timeout: Duration::from_secs(settings.spam_timeout_minutes as u64 * 60),
+                };
                 let violation = state.spam_tracker.check(
                     guild_id,
                     message.author.id,
                     &message.content,
                     mention_count,
+                    spam_thresholds,
                 );
 
                 if let Some(violation) = violation {
-                    handle_spam_violation(&state, &message, guild_id, &violation).await;
+                    handle_spam_violation(
+                        &state,
+                        &message,
+                        guild_id,
+                        &violation,
+                        spam_thresholds.timeout,
+                    )
+                    .await;
                 }
             }
         }
@@ -127,8 +161,17 @@ async fn handle_event(event: Event, state: Arc<AppState>) {
                 return;
             }
 
+            let raid_thresholds = raid::RaidThresholds {
+                burst_threshold: settings.raid_burst_threshold as usize,
+                suspicious_threshold: settings.raid_suspicious_threshold as usize,
+                timeout: Duration::from_secs(settings.raid_timeout_minutes as u64 * 60),
+            };
+
             let detector_started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
-            let raid_check = state.join_tracker.record(guild_id, &member_add.member);
+            let raid_check =
+                state
+                    .join_tracker
+                    .record(guild_id, &member_add.member, raid_thresholds);
             if let Some(started) = detector_started {
                 tracing::debug!(
                     detector_ns = started.elapsed().as_nanos(),
@@ -139,15 +182,26 @@ async fn handle_event(event: Event, state: Arc<AppState>) {
             }
 
             if let Some(incident) = raid_check.incident {
-                let lockdown_started =
-                    handle_raid_violation(&state, guild_id, &incident.violation, &incident.window)
-                        .await;
+                let lockdown_started = handle_raid_violation(
+                    &state,
+                    guild_id,
+                    &incident.violation,
+                    &incident.window,
+                    raid_thresholds.timeout,
+                )
+                .await;
                 if !lockdown_started {
                     state.join_tracker.schedule_incident_retry(guild_id);
                 }
             } else if raid_check.raid_active {
                 if raid_check.latest.is_suspicious {
-                    handle_active_raid_join(&state, guild_id, &raid_check.latest).await;
+                    handle_active_raid_join(
+                        &state,
+                        guild_id,
+                        &raid_check.latest,
+                        raid_thresholds.timeout,
+                    )
+                    .await;
                 }
             } else if raid_check.latest.is_suspicious {
                 if let Some(seconds_since_removal) =
@@ -193,11 +247,21 @@ async fn handle_event(event: Event, state: Arc<AppState>) {
                 return;
             }
 
-            if let Some(violation) =
-                state
-                    .nuke_tracker
-                    .record(guild_id, actor_id, entry.action_type)
-            {
+            // Independent of the burst counting below: a bot/app added by
+            // someone who doesn't hold the guild's trusted role gets
+            // reacted to immediately, not only after 3 dangerous actions
+            // in 30 seconds. BotAdd still also counts toward that burst
+            // either way — this doesn't replace it.
+            if entry.action_type == AuditLogEventType::BotAdd {
+                handle_unauthorized_bot_add(&state, guild_id, actor_id, entry.target_id).await;
+            }
+
+            if let Some(violation) = state.nuke_tracker.record(
+                guild_id,
+                actor_id,
+                entry.action_type,
+                settings.nuke_burst_threshold as usize,
+            ) {
                 handle_nuke_violation(&state, guild_id, actor_id, &violation).await;
             }
         }
@@ -264,6 +328,59 @@ async fn handle_scam_message(
     }
 }
 
+/// Deletes a message containing a Discord invite link from someone who
+/// doesn't hold this server's trusted role (checked by the caller). No
+/// timeout in this pass — deletion only, to avoid punishing a false
+/// positive (e.g. someone who should have the trusted role but doesn't
+/// yet) more harshly than necessary.
+async fn handle_invite_link(state: &AppState, message: &twilight_model::channel::Message, guild_id: Id<GuildMarker>) {
+    tracing::warn!(
+        author = %message.author.name,
+        channel_id = %message.channel_id,
+        "deleting message with an invite link"
+    );
+
+    if let Err(source) = state
+        .http
+        .delete_message(message.channel_id, message.id)
+        .await
+    {
+        tracing::error!(?source, "failed to delete invite-link message");
+    }
+
+    let description = format!(
+        "Deleted an invite-link message in channel {} from a user without the trusted role.",
+        message.channel_id
+    );
+    if let Err(source) = models::record_security_event(
+        &state.db,
+        guild_id,
+        Some(message.author.id),
+        "invite_link_deleted",
+        "medium",
+        &description,
+    )
+    .await
+    {
+        tracing::error!(?source, "failed to record invite-link security event");
+    }
+
+    let Some(log_channel_id) = models::get_log_channel_id(&state.db, guild_id).await else {
+        return;
+    };
+
+    let embed = embeds::invite_link_deleted(message);
+
+    if let Err(source) = state
+        .http
+        .create_message(log_channel_id)
+        .embeds(&[embed])
+        .await
+    {
+        tracing::error!(?source, "failed to send invite-link log embed");
+    }
+}
+
 /// Deletes a message that tripped the anti-spam filter, times its author
 /// out (unless they're the server owner — see below), and — if a log
 /// channel is configured — sends staff an embed explaining what happened.
@@ -272,6 +389,7 @@ async fn handle_spam_violation(
     message: &twilight_model::channel::Message,
     guild_id: Id<GuildMarker>,
     violation: &SpamViolation,
+    timeout_duration: Duration,
 ) {
     tracing::warn!(
         author = %message.author.name,
@@ -306,7 +424,7 @@ async fn handle_spam_violation(
         match state
             .http
             .update_guild_member(guild_id, message.author.id)
-            .communication_disabled_until(Some(spam::timeout_until()))
+            .communication_disabled_until(Some(spam::timeout_until(timeout_duration)))
             .await
         {
             Ok(_) => true,
@@ -375,6 +493,7 @@ async fn handle_raid_violation(
     guild_id: Id<GuildMarker>,
     violation: &RaidViolation,
     window: &[raid::JoinRecord],
+    raid_timeout: Duration,
 ) -> bool {
     tracing::warn!(
         %guild_id,
@@ -399,7 +518,7 @@ async fn handle_raid_violation(
     let mut timed_out_count = 0;
 
     for record in window.iter().filter(|record| record.is_suspicious) {
-        if timeout_raid_joiner(state, guild_id, record, owner_id).await {
+        if timeout_raid_joiner(state, guild_id, record, owner_id, raid_timeout).await {
             timed_out_count += 1;
         }
     }
@@ -451,9 +570,10 @@ async fn handle_active_raid_join(
     state: &AppState,
     guild_id: Id<GuildMarker>,
     record: &raid::JoinRecord,
+    raid_timeout: Duration,
 ) {
     let owner_id = models::get_owner_id(&state.db, guild_id).await;
-    if timeout_raid_joiner(state, guild_id, record, owner_id).await {
+    if timeout_raid_joiner(state, guild_id, record, owner_id, raid_timeout).await {
         tracing::info!(
             %guild_id,
             user_id = %record.user_id,
@@ -467,6 +587,7 @@ async fn timeout_raid_joiner(
     guild_id: Id<GuildMarker>,
     record: &raid::JoinRecord,
     owner_id: Option<Id<UserMarker>>,
+    raid_timeout: Duration,
 ) -> bool {
     // Same owner-immunity check as anti-spam: Discord never allows
     // moderating the guild owner, regardless of permissions.
@@ -477,7 +598,7 @@ async fn timeout_raid_joiner(
     match state
         .http
         .update_guild_member(guild_id, record.user_id)
-        .communication_disabled_until(Some(raid::raid_timeout_until()))
+        .communication_disabled_until(Some(raid::raid_timeout_until(raid_timeout)))
         .await
     {
         Ok(_) => true,
@@ -595,30 +716,7 @@ async fn handle_nuke_violation(
         return;
     }
 
-    let mut roles_removed = 0;
-
-    if let Ok(roles_response) = state.http.roles(guild_id).await {
-        if let Ok(roles) = roles_response.model().await {
-            let dangerous_ids = permissions::dangerous_role_ids(&roles);
-
-            if let Ok(member_response) = state.http.guild_member(guild_id, actor_id).await {
-                if let Ok(member) = member_response.model().await {
-                    for role_id in member.roles.iter().filter(|id| dangerous_ids.contains(id)) {
-                        match state
-                            .http
-                            .remove_guild_member_role(guild_id, actor_id, *role_id)
-                            .await
-                        {
-                            Ok(_) => roles_removed += 1,
-                            Err(source) => {
-                                tracing::error!(?source, %guild_id, %actor_id, %role_id, "failed to strip dangerous role from nuke actor");
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let roles_removed = strip_dangerous_roles(state, guild_id, actor_id).await;
 
     let quarantined = if let Some(quarantine_role_id) =
         models::get_quarantine_role_id(&state.db, guild_id).await
@@ -701,5 +799,143 @@ async fn handle_nuke_violation(
         .await
     {
         tracing::error!(?source, %guild_id, "failed to send nuke log embed");
+    }
+}
+
+/// Removes every role `actor_id` holds that `permissions::dangerous_role_ids`
+/// flags, returning how many were actually removed. Shared by the nuke
+/// response above and the unauthorized-bot-add gate below — both treat
+/// "strip an actor's admin-level roles" as the same corrective action.
+async fn strip_dangerous_roles(
+    state: &AppState,
+    guild_id: Id<GuildMarker>,
+    actor_id: Id<UserMarker>,
+) -> usize {
+    let mut roles_removed = 0;
+
+    if let Ok(roles_response) = state.http.roles(guild_id).await {
+        if let Ok(roles) = roles_response.model().await {
+            let dangerous_ids = permissions::dangerous_role_ids(&roles);
+
+            if let Ok(member_response) = state.http.guild_member(guild_id, actor_id).await {
+                if let Ok(member) = member_response.model().await {
+                    for role_id in member.roles.iter().filter(|id| dangerous_ids.contains(id)) {
+                        match state
+                            .http
+                            .remove_guild_member_role(guild_id, actor_id, *role_id)
+                            .await
+                        {
+                            Ok(_) => roles_removed += 1,
+                            Err(source) => {
+                                tracing::error!(?source, %guild_id, %actor_id, %role_id, "failed to strip dangerous role");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    roles_removed
+}
+
+/// Reacts when a bot/app is added to the server by someone who doesn't
+/// hold the guild's configured trusted role: kicks the newly-added bot and
+/// strips the adding actor's dangerous roles, the same severity as a
+/// confirmed nuke attempt. A guild with no trusted role configured yet has
+/// no one to exempt, so this is a no-op there — BotAdd still counts toward
+/// the generic nuke-burst threshold either way (see the caller).
+async fn handle_unauthorized_bot_add(
+    state: &AppState,
+    guild_id: Id<GuildMarker>,
+    actor_id: Id<UserMarker>,
+    target_id: Option<Id<twilight_model::id::marker::GenericMarker>>,
+) {
+    let Some(trusted_role_id) = models::get_trusted_role_id(&state.db, guild_id).await else {
+        return;
+    };
+
+    let owner_id = models::get_owner_id(&state.db, guild_id).await;
+    if owner_id == Some(actor_id) {
+        return;
+    }
+
+    let has_trusted_role = match state.http.guild_member(guild_id, actor_id).await {
+        Ok(response) => match response.model().await {
+            Ok(member) => member.roles.contains(&trusted_role_id),
+            Err(source) => {
+                tracing::error!(?source, %guild_id, %actor_id, "failed to decode member while checking the trusted role");
+                return;
+            }
+        },
+        Err(source) => {
+            tracing::error!(?source, %guild_id, %actor_id, "failed to look up member while checking the trusted role");
+            return;
+        }
+    };
+
+    if has_trusted_role {
+        return;
+    }
+
+    let bot_kicked = match target_id {
+        Some(target_id) => {
+            let bot_user_id = target_id.cast::<UserMarker>();
+            match state.http.remove_guild_member(guild_id, bot_user_id).await {
+                Ok(_) => true,
+                Err(source) => {
+                    tracing::error!(?source, %guild_id, %bot_user_id, "failed to kick unauthorized bot");
+                    false
+                }
+            }
+        }
+        None => {
+            tracing::warn!(%guild_id, "BotAdd audit-log entry had no target_id, could not kick the bot");
+            false
+        }
+    };
+
+    let roles_removed = strip_dangerous_roles(state, guild_id, actor_id).await;
+
+    tracing::warn!(
+        %guild_id,
+        %actor_id,
+        bot_kicked,
+        roles_removed,
+        "unauthorized bot add: actor did not hold the trusted role"
+    );
+
+    let description = format!(
+        "<@{actor_id}> added a bot/app without holding this server's trusted role. Bot removed: \
+        {}. Stripped {roles_removed} dangerous role(s) from <@{actor_id}>.",
+        if bot_kicked { "yes" } else { "no — check the bot's Kick Members permission" }
+    );
+
+    if let Err(source) = models::record_security_event(
+        &state.db,
+        guild_id,
+        Some(actor_id),
+        "unauthorized_bot_add",
+        "critical",
+        &description,
+    )
+    .await
+    {
+        tracing::error!(?source, %guild_id, "failed to record unauthorized-bot-add security event");
+    }
+
+    let Some(log_channel_id) = models::get_log_channel_id(&state.db, guild_id).await else {
+        return;
+    };
+
+    let embed = embeds::unauthorized_bot_add(actor_id, bot_kicked, roles_removed);
+
+    if let Err(source) = state
+        .http
+        .create_message(log_channel_id)
+        .embeds(&[embed])
+        .await
+    {
+        tracing::error!(?source, %guild_id, "failed to send unauthorized-bot-add log embed");
     }
 }

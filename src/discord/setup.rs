@@ -25,6 +25,7 @@ const CREATE_DEFAULTS_ID: &str = "setup:create_defaults";
 const LOG_CHANNEL_SELECT_ID: &str = "setup:log_channel";
 const VERIFIED_ROLE_SELECT_ID: &str = "setup:verified_role";
 const QUARANTINE_ROLE_SELECT_ID: &str = "setup:quarantine_role";
+const TRUSTED_ROLE_SELECT_ID: &str = "setup:trusted_role";
 const QUICK_CHECK_ID: &str = "setup:quick_check";
 
 struct SetupPanel {
@@ -227,6 +228,47 @@ pub async fn handle_component(
                 }
             }
         }
+        TRUSTED_ROLE_SELECT_ID => {
+            let Some(role_id) = selected_id::<RoleMarker>(component) else {
+                update_panel(
+                    interaction,
+                    state,
+                    guild_id,
+                    Some("No trusted role was selected."),
+                    &[],
+                )
+                .await;
+                return;
+            };
+
+            if !ensure_initialized(interaction, state, guild_id).await {
+                return;
+            }
+
+            match models::set_trusted_role_id(&state.db, guild_id, role_id).await {
+                Ok(()) => {
+                    update_panel(
+                        interaction,
+                        state,
+                        guild_id,
+                        Some("Trusted role updated."),
+                        &[],
+                    )
+                    .await;
+                }
+                Err(source) => {
+                    tracing::error!(?source, %guild_id, "failed to save setup trusted role");
+                    update_panel(
+                        interaction,
+                        state,
+                        guild_id,
+                        Some("Blackwall could not save that trusted role. Please try again."),
+                        &[],
+                    )
+                    .await;
+                }
+            }
+        }
         QUICK_CHECK_ID => run_quick_check(interaction, state, guild_id).await,
         _ => {
             tracing::warn!(custom_id = %component.custom_id, "received unknown setup component");
@@ -379,6 +421,7 @@ async fn initialize_defaults(
         log_channel_id: Some(log_channel_id),
         verified_role_id: Some(verified_role_id),
         quarantine_role_id: Some(quarantine_role_id),
+        trusted_role_id: None,
     };
     models::upsert_guild_config(&state.db, &config)
         .await
@@ -579,6 +622,20 @@ fn build_components(config: Option<&GuildConfig>) -> Vec<Component> {
         placeholder: Some("Select quarantine role".to_owned()),
     };
 
+    let trusted_role_select = SelectMenu {
+        channel_types: None,
+        custom_id: TRUSTED_ROLE_SELECT_ID.to_owned(),
+        default_values: config
+            .and_then(|config| config.trusted_role_id)
+            .map(|role_id| vec![SelectDefaultValue::Role(role_id)]),
+        disabled: !initialized,
+        kind: SelectMenuType::Role,
+        max_values: Some(1),
+        min_values: Some(1),
+        options: None,
+        placeholder: Some("Select trusted role (bot adds, invite links)".to_owned()),
+    };
+
     let defaults_button = Button {
         custom_id: Some(CREATE_DEFAULTS_ID.to_owned()),
         disabled: initialized,
@@ -611,6 +668,9 @@ fn build_components(config: Option<&GuildConfig>) -> Vec<Component> {
         }),
         Component::ActionRow(ActionRow {
             components: vec![Component::SelectMenu(quarantine_role_select)],
+        }),
+        Component::ActionRow(ActionRow {
+            components: vec![Component::SelectMenu(trusted_role_select)],
         }),
         Component::ActionRow(ActionRow {
             components: vec![
@@ -765,10 +825,11 @@ mod tests {
     fn selectors_wait_for_default_setup() {
         let components = build_components(None);
 
-        assert_eq!(components.len(), 4);
+        assert_eq!(components.len(), 5);
         assert!(select_is_disabled(&components, 0));
         assert!(select_is_disabled(&components, 1));
         assert!(select_is_disabled(&components, 2));
+        assert!(select_is_disabled(&components, 3));
     }
 
     #[test]
@@ -779,11 +840,13 @@ mod tests {
             log_channel_id: Some(Id::new(3)),
             verified_role_id: Some(Id::new(4)),
             quarantine_role_id: Some(Id::new(5)),
+            trusted_role_id: Some(Id::new(6)),
         };
         let components = build_components(Some(&config));
 
         assert!(!select_is_disabled(&components, 0));
         assert!(!select_is_disabled(&components, 1));
         assert!(!select_is_disabled(&components, 2));
+        assert!(!select_is_disabled(&components, 3));
     }
 }

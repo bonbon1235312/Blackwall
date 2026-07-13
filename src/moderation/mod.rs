@@ -5,6 +5,7 @@
 //! turn into one giant "does everything" module.
 
 pub mod evasion;
+pub mod invite;
 pub mod nuke;
 pub mod permissions;
 pub mod raid;

@@ -8,21 +8,38 @@ use twilight_model::util::Timestamp;
 
 /// How far back message history is kept per user, per guild. Anything
 /// older than this is dropped the next time that user posts — this bounds
-/// memory use per user without needing a separate cleanup task.
+/// memory use per user without needing a separate cleanup task. Not
+/// configurable — `/config` exposes the count thresholds below, not the
+/// window itself.
 const WINDOW: Duration = Duration::from_secs(10);
 
-/// More than this many messages inside `WINDOW` counts as a burst.
-const BURST_THRESHOLD: usize = 6;
+/// Fallback thresholds/timeout for a guild with no `guild_settings` row
+/// yet — must match `guild_settings`' own column defaults in schema.sql.
+pub const DEFAULT_BURST_THRESHOLD: usize = 6;
+pub const DEFAULT_REPEAT_THRESHOLD: usize = 3;
+pub const DEFAULT_MENTION_THRESHOLD: usize = 5;
+pub const DEFAULT_TIMEOUT_DURATION: Duration = Duration::from_secs(10 * 60);
 
-/// This many *identical* messages in a row (within `WINDOW`) counts as
-/// copy-paste spam.
-const REPEAT_THRESHOLD: usize = 3;
+/// The per-guild thresholds `/config` can adjust, read from `GuildSettings`
+/// at the call site and passed in by value.
+#[derive(Clone, Copy)]
+pub struct SpamThresholds {
+    pub burst_threshold: usize,
+    pub repeat_threshold: usize,
+    pub mention_threshold: usize,
+    pub timeout: Duration,
+}
 
-/// This many user mentions in a single message counts as mention spam.
-const MENTION_THRESHOLD: usize = 5;
-
-/// How long a user is timed out for when a violation is actioned.
-pub const TIMEOUT_DURATION: Duration = Duration::from_secs(10 * 60);
+impl Default for SpamThresholds {
+    fn default() -> Self {
+        Self {
+            burst_threshold: DEFAULT_BURST_THRESHOLD,
+            repeat_threshold: DEFAULT_REPEAT_THRESHOLD,
+            mention_threshold: DEFAULT_MENTION_THRESHOLD,
+            timeout: DEFAULT_TIMEOUT_DURATION,
+        }
+    }
+}
 
 struct MessageEvent {
     at: Instant,
@@ -60,13 +77,13 @@ impl SpamViolation {
 }
 
 /// The point in time a timeout applied right now should end.
-pub fn timeout_until() -> Timestamp {
+pub fn timeout_until(duration: Duration) -> Timestamp {
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock is set before 1970")
         .as_secs();
 
-    let until_secs = now_secs + TIMEOUT_DURATION.as_secs();
+    let until_secs = now_secs + duration.as_secs();
 
     Timestamp::from_secs(until_secs as i64)
         .expect("computed timeout timestamp was outside Discord's valid range")
@@ -89,8 +106,9 @@ impl SpamTracker {
         user_id: Id<UserMarker>,
         content: &str,
         mention_count: usize,
+        thresholds: SpamThresholds,
     ) -> Option<SpamViolation> {
-        if mention_count >= MENTION_THRESHOLD {
+        if mention_count >= thresholds.mention_threshold {
             return Some(SpamViolation::MentionSpam {
                 count: mention_count,
             });
@@ -125,13 +143,13 @@ impl SpamTracker {
                 .count()
         };
 
-        if repeat_count >= REPEAT_THRESHOLD {
+        if repeat_count >= thresholds.repeat_threshold {
             return Some(SpamViolation::RepeatedMessages {
                 count: repeat_count,
             });
         }
 
-        if history.len() >= BURST_THRESHOLD {
+        if history.len() >= thresholds.burst_threshold {
             return Some(SpamViolation::MessageBurst {
                 count: history.len(),
             });
