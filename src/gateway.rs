@@ -8,6 +8,7 @@ use twilight_model::guild::audit_log::AuditLogEventType;
 use twilight_model::id::marker::{GuildMarker, UserMarker};
 use twilight_model::id::Id;
 
+use crate::actions;
 use crate::actions::lockdown;
 use crate::discord::{embeds, interactions, prefix};
 use crate::moderation::invite;
@@ -53,11 +54,25 @@ pub async fn run(token: String, state: Arc<AppState>) {
     // joins enough servers, which is a later-stage concern.
     let mut shard = Shard::with_config(ShardId::ONE, config);
 
+    // Exactly the event types `handle_event`'s match arms below act on.
+    // twilight-gateway skips full JSON deserialization for anything
+    // outside this mask (it's a dispatch-level filter, not a post-parse
+    // discard) — every event type not listed here (typing indicators,
+    // presence updates, etc.) is dropped before Blackwall pays to decode
+    // it, not after. Doesn't affect Shard-level control frames (heartbeat
+    // ack, reconnect, invalid session) — those aren't Dispatch events and
+    // are handled by Shard regardless of this mask.
+    let wanted_events = EventTypeFlags::READY
+        | EventTypeFlags::MESSAGE_CREATE
+        | EventTypeFlags::MEMBER_ADD
+        | EventTypeFlags::GUILD_AUDIT_LOG_ENTRY_CREATE
+        | EventTypeFlags::INTERACTION_CREATE;
+
     tracing::info!("connecting to the Discord gateway...");
 
     // `next_event` yields `None` only when the shard is shutting down for
     // good, so this loop is effectively the bot's lifetime.
-    while let Some(item) = shard.next_event(EventTypeFlags::all()).await {
+    while let Some(item) = shard.next_event(wanted_events).await {
         let event = match item {
             Ok(event) => event,
             Err(source) => {
@@ -809,6 +824,10 @@ async fn handle_nuke_violation(
     }
 }
 
+/// Same reasoning as `actions::lockdown::LOCK_CONCURRENCY` — bounds how many
+/// role-removal REST calls run at once instead of one at a time.
+const ROLE_STRIP_CONCURRENCY: usize = 10;
+
 /// Removes every role `actor_id` holds that `permissions::dangerous_role_ids`
 /// flags, returning how many were actually removed. Shared by the nuke
 /// response above and the unauthorized-bot-add gate below — both treat
@@ -818,30 +837,44 @@ async fn strip_dangerous_roles(
     guild_id: Id<GuildMarker>,
     actor_id: Id<UserMarker>,
 ) -> usize {
-    let mut roles_removed = 0;
+    let Ok(roles_response) = state.http.roles(guild_id).await else {
+        return 0;
+    };
+    let Ok(roles) = roles_response.model().await else {
+        return 0;
+    };
+    let dangerous_ids = permissions::dangerous_role_ids(&roles);
 
-    if let Ok(roles_response) = state.http.roles(guild_id).await {
-        if let Ok(roles) = roles_response.model().await {
-            let dangerous_ids = permissions::dangerous_role_ids(&roles);
+    let Ok(member_response) = state.http.guild_member(guild_id, actor_id).await else {
+        return 0;
+    };
+    let Ok(member) = member_response.model().await else {
+        return 0;
+    };
 
-            if let Ok(member_response) = state.http.guild_member(guild_id, actor_id).await {
-                if let Ok(member) = member_response.model().await {
-                    for role_id in member.roles.iter().filter(|id| dangerous_ids.contains(id)) {
-                        match state
-                            .http
-                            .remove_guild_member_role(guild_id, actor_id, *role_id)
-                            .await
-                        {
-                            Ok(_) => roles_removed += 1,
-                            Err(source) => {
-                                tracing::error!(?source, %guild_id, %actor_id, %role_id, "failed to strip dangerous role");
-                            }
-                        }
+    let actions: Vec<actions::concurrent::BoxedAction> = member
+        .roles
+        .iter()
+        .filter(|role_id| dangerous_ids.contains(role_id))
+        .map(|role_id| {
+            let role_id = *role_id;
+            Box::pin(async move {
+                match state
+                    .http
+                    .remove_guild_member_role(guild_id, actor_id, role_id)
+                    .await
+                {
+                    Ok(_) => true,
+                    Err(source) => {
+                        tracing::error!(?source, %guild_id, %actor_id, %role_id, "failed to strip dangerous role");
+                        false
                     }
                 }
-            }
-        }
-    }
+            }) as actions::concurrent::BoxedAction
+        })
+        .collect();
+
+    let (roles_removed, _) = actions::concurrent::dispatch(actions, ROLE_STRIP_CONCURRENCY).await;
 
     roles_removed
 }

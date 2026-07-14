@@ -1,7 +1,9 @@
 use std::collections::VecDeque;
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
+use rustc_hash::FxHasher;
 use twilight_model::id::Id;
 use twilight_model::id::marker::{GuildMarker, UserMarker};
 use twilight_model::util::Timestamp;
@@ -43,7 +45,17 @@ impl Default for SpamThresholds {
 
 struct MessageEvent {
     at: Instant,
-    content: String,
+    // `None` for empty content (attachment-only messages), which is never
+    // treated as a repeat regardless of what any other empty message's
+    // hash would be. A u64 hash instead of the raw `String` avoids cloning
+    // every message's text just to keep it around for an equality check.
+    content_hash: Option<u64>,
+}
+
+fn hash_content(content: &str) -> u64 {
+    let mut hasher = FxHasher::default();
+    content.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Tracks recent message activity per (guild, user) so patterns that span
@@ -125,22 +137,27 @@ impl SpamTracker {
             }
         }
 
+        let this_hash = if content.is_empty() {
+            None
+        } else {
+            Some(hash_content(content))
+        };
+
         history.push_back(MessageEvent {
             at: now,
-            content: content.to_string(),
+            content_hash: this_hash,
         });
 
         // How many of the most recent messages are identical to this one.
         // Empty content (e.g. an attachment-only message) is never treated
         // as a "repeat" — plenty of legitimate messages have no text.
-        let repeat_count = if content.is_empty() {
-            0
-        } else {
-            history
+        let repeat_count = match this_hash {
+            None => 0,
+            Some(hash) => history
                 .iter()
                 .rev()
-                .take_while(|event| event.content == content)
-                .count()
+                .take_while(|event| event.content_hash == Some(hash))
+                .count(),
         };
 
         if repeat_count >= thresholds.repeat_threshold {

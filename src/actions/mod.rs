@@ -5,4 +5,5 @@
 //! "an action" — see `01_ARCHITECTURE.md` for why this wasn't created
 //! earlier and why lockdown is the first thing that qualifies.
 
+pub mod concurrent;
 pub mod lockdown;
