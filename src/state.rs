@@ -3,18 +3,22 @@ use std::sync::Arc;
 use aho_corasick::AhoCorasick;
 use reqwest::Client as ReqwestClient;
 use sqlx::PgPool;
+use tokio::sync::mpsc;
 use twilight_http::Client as HttpClient;
 use twilight_model::id::{
     Id,
     marker::{ApplicationMarker, GuildMarker},
 };
 
+use crate::moderation::bot_add_gate::BotAddGate;
 use crate::moderation::evasion::EvasionTracker;
 use crate::moderation::nuke::NukeTracker;
 use crate::moderation::raid::JoinTracker;
 use crate::moderation::spam::SpamTracker;
 use crate::storage::cache::SettingsCache;
+use crate::storage::role_cache::RoleCache;
 use crate::verification::dashboard::DashboardSessionStore;
+use crate::verification::events::VerificationEvent;
 use crate::verification::sessions::SessionStore;
 
 /// State shared across the entire bot.
@@ -90,4 +94,21 @@ pub struct AppState {
     /// path (checked on every single message) never makes a network
     /// round-trip to Supabase. See `storage::cache` for invalidation.
     pub settings_cache: SettingsCache,
+
+    /// In-memory cache over each guild's role-permission table, so a
+    /// prefix command's permission check doesn't pay a Discord API call
+    /// per invocation. See `storage::role_cache` for invalidation.
+    pub role_cache: RoleCache,
+
+    /// Resolves the `MemberAdd` vs. `GuildAuditLogEntryCreate(BotAdd)`
+    /// race for the trusted-role bot-add gate. See `moderation::bot_add_gate`.
+    pub bot_add_gate: BotAddGate,
+
+    /// Non-blocking queue for verification bookkeeping (the `verified_users`
+    /// row, the `verification_success` security event) that doesn't need to
+    /// complete before a verifying user's browser gets redirected — see
+    /// `verification::events`. The paired `Receiver` is owned by the
+    /// background task `main.rs` spawns; `AppState` only ever holds this
+    /// `Sender` half.
+    pub verification_events: mpsc::UnboundedSender<VerificationEvent>,
 }

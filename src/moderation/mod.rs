@@ -4,6 +4,7 @@
 //! permission-risk checks. Each concern gets its own file so none of them
 //! turn into one giant "does everything" module.
 
+pub mod bot_add_gate;
 pub mod evasion;
 pub mod invite;
 pub mod nuke;

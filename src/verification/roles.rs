@@ -1,4 +1,5 @@
 use sqlx::PgPool;
+use tokio::sync::mpsc;
 use twilight_http::Client as HttpClient;
 use twilight_model::id::{
     Id,
@@ -6,6 +7,7 @@ use twilight_model::id::{
 };
 
 use crate::storage::models;
+use crate::verification::events::VerificationEvent;
 
 #[derive(Debug)]
 pub enum GrantVerifiedRoleError {
@@ -29,6 +31,7 @@ impl From<sqlx::Error> for GrantVerifiedRoleError {
 pub async fn grant_verified_role(
     http: &HttpClient,
     db: &PgPool,
+    events: &mpsc::UnboundedSender<VerificationEvent>,
     guild_id: Id<GuildMarker>,
     user_id: Id<UserMarker>,
 ) -> Result<(), GrantVerifiedRoleError> {
@@ -39,7 +42,16 @@ pub async fn grant_verified_role(
     http.add_guild_member_role(guild_id, user_id, role_id)
         .await?;
 
-    models::record_verification(db, guild_id, user_id, "oauth").await?;
+    // The Discord-side security boundary this whole flow exists to
+    // enforce is already satisfied at this point — recording the row is
+    // bookkeeping, deferred to the batched writer instead of costing this
+    // request another Postgres round-trip. A dropped receiver (writer task
+    // gone) only means the process is shutting down; nothing to recover.
+    let _ = events.send(VerificationEvent::Completed {
+        guild_id,
+        user_id,
+        method: "oauth",
+    });
 
     Ok(())
 }

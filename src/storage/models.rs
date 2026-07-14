@@ -514,28 +514,6 @@ pub async fn get_quarantine_role_id(
     })
 }
 
-/// Records that a user successfully completed verification for a guild.
-pub async fn record_verification(
-    pool: &PgPool,
-    guild_id: Id<GuildMarker>,
-    user_id: Id<UserMarker>,
-    method: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO verified_users (guild_id, user_id, method) VALUES ($1, $2, $3)
-         ON CONFLICT (guild_id, user_id) DO UPDATE SET
-            method = excluded.method,
-            verified_at = now()",
-    )
-    .bind(guild_id.to_string())
-    .bind(user_id.to_string())
-    .bind(method)
-    .execute(pool)
-    .await?;
-
-    Ok(())
-}
-
 /// Records a moderation/security event for later dashboard and audit views.
 pub async fn record_security_event(
     pool: &PgPool,
@@ -554,6 +532,80 @@ pub async fn record_security_event(
     .bind(event_type)
     .bind(severity)
     .bind(description)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// `(guild_id, user_id, method)` — one pending row for
+/// [`record_verifications_batch`].
+pub type VerificationRecord = (Id<GuildMarker>, Id<UserMarker>, &'static str);
+
+/// `(guild_id, user_id, event_type, severity, description)` — one pending
+/// row for [`record_security_events_batch`].
+pub type SecurityEventRecord = (
+    Id<GuildMarker>,
+    Option<Id<UserMarker>>,
+    &'static str,
+    &'static str,
+    String,
+);
+
+/// Records that a batch of users each completed verification for a guild —
+/// one `INSERT ... SELECT * FROM UNNEST(...)` round-trip for however many
+/// accumulated since the last flush, instead of one round-trip per user.
+/// Used by `verification::events::run`, never called directly from a
+/// request handler (callers on the hot path should push a
+/// `VerificationEvent` instead — see that module for why).
+pub async fn record_verifications_batch(
+    pool: &PgPool,
+    records: Vec<VerificationRecord>,
+) -> Result<(), sqlx::Error> {
+    let guild_ids: Vec<String> = records.iter().map(|(g, _, _)| g.to_string()).collect();
+    let user_ids: Vec<String> = records.iter().map(|(_, u, _)| u.to_string()).collect();
+    let methods: Vec<&str> = records.iter().map(|(_, _, m)| *m).collect();
+
+    sqlx::query(
+        "INSERT INTO verified_users (guild_id, user_id, method)
+         SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[])
+         ON CONFLICT (guild_id, user_id) DO UPDATE SET
+            method = excluded.method,
+            verified_at = now()",
+    )
+    .bind(guild_ids)
+    .bind(user_ids)
+    .bind(methods)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Batched form of [`record_security_event`] — see
+/// [`record_verifications_batch`] for why this exists.
+pub async fn record_security_events_batch(
+    pool: &PgPool,
+    events: Vec<SecurityEventRecord>,
+) -> Result<(), sqlx::Error> {
+    let guild_ids: Vec<String> = events.iter().map(|(g, _, _, _, _)| g.to_string()).collect();
+    let user_ids: Vec<Option<String>> = events
+        .iter()
+        .map(|(_, u, _, _, _)| u.map(|id| id.to_string()))
+        .collect();
+    let event_types: Vec<&str> = events.iter().map(|(_, _, t, _, _)| *t).collect();
+    let severities: Vec<&str> = events.iter().map(|(_, _, _, s, _)| *s).collect();
+    let descriptions: Vec<String> = events.into_iter().map(|(_, _, _, _, d)| d).collect();
+
+    sqlx::query(
+        "INSERT INTO security_events (guild_id, user_id, event_type, severity, description)
+         SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[])",
+    )
+    .bind(guild_ids)
+    .bind(user_ids)
+    .bind(event_types)
+    .bind(severities)
+    .bind(descriptions)
     .execute(pool)
     .await?;
 

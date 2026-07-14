@@ -14,7 +14,7 @@ use crate::discord::embeds;
 use crate::moderation::permissions;
 use crate::state::AppState;
 use crate::storage::models;
-use crate::verification::{oauth, roles};
+use crate::verification::{events, oauth, roles};
 use crate::web::templates;
 
 /// Name of the cookie holding an owner dashboard session token. Set
@@ -209,8 +209,14 @@ async fn callback(
         }
     };
 
-    if let Err(source) =
-        roles::grant_verified_role(state.http.as_ref(), &state.db, pending.guild_id, user.id).await
+    if let Err(source) = roles::grant_verified_role(
+        state.http.as_ref(),
+        &state.db,
+        &state.verification_events,
+        pending.guild_id,
+        user.id,
+    )
+    .await
     {
         return match source {
             roles::GrantVerifiedRoleError::GuildNotSetUp => Html(templates::error_page(
@@ -234,10 +240,10 @@ async fn callback(
                     ?source,
                     guild_id = %pending.guild_id,
                     user_id = %user.id,
-                    "failed to record verification"
+                    "failed to read this guild's verified-role configuration"
                 );
                 Html(templates::error_page(
-                    "Blackwall verified your account, but could not save the verification record.",
+                    "Blackwall could not read this server's configuration. Please try again.",
                 ))
                 .into_response()
             }
@@ -251,18 +257,16 @@ async fn callback(
         "user completed OAuth verification"
     );
 
-    if let Err(source) = models::record_security_event(
-        &state.db,
-        pending.guild_id,
-        Some(user.id),
-        "verification_success",
-        "info",
-        "User completed OAuth verification and received the Verified role.",
-    )
-    .await
-    {
-        tracing::warn!(?source, guild_id = %pending.guild_id, user_id = %user.id, "failed to record verification security event");
-    }
+    // The Verified role is already granted (synchronously, above) — this
+    // is bookkeeping, deferred to the same background queue so it can't
+    // add Postgres round-trips to this response. See verification::events.
+    let _ = state.verification_events.send(events::VerificationEvent::SecurityEvent {
+        guild_id: pending.guild_id,
+        user_id: Some(user.id),
+        event_type: "verification_success",
+        severity: "info",
+        description: "User completed OAuth verification and received the Verified role.".to_string(),
+    });
 
     // Best-effort, and only attempted at all if the user chose the
     // "verify + join support server" button on the verify page for this
@@ -325,22 +329,17 @@ async fn attempt_support_join(
         }
     };
 
-    if let Err(source) = models::record_security_event(
-        &state.db,
+    let _ = state.verification_events.send(events::VerificationEvent::SecurityEvent {
         guild_id,
-        Some(user.id),
-        if succeeded {
+        user_id: Some(user.id),
+        event_type: if succeeded {
             "support_server_join_success"
         } else {
             "support_server_join_failed"
         },
         severity,
-        &description,
-    )
-    .await
-    {
-        tracing::warn!(?source, %guild_id, user_id = %user.id, "failed to record support-join security event");
-    }
+        description,
+    });
 
     if let Some(log_channel_id) = models::get_log_channel_id(&state.db, guild_id).await {
         let embed = embeds::support_join_result(user, succeeded);

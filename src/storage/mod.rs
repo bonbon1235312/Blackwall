@@ -5,3 +5,4 @@
 pub mod cache;
 pub mod database;
 pub mod models;
+pub mod role_cache;

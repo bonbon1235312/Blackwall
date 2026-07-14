@@ -11,7 +11,6 @@ use twilight_util::builder::InteractionResponseDataBuilder;
 use twilight_util::permission_calculator::PermissionCalculator;
 
 use crate::state::AppState;
-use crate::storage::models;
 
 /// Abstracts over "a slash command interaction" vs. a `!`/`?` prefix
 /// command message. Every command's actual logic — permission gate, do
@@ -51,11 +50,12 @@ impl CommandSource<'_> {
     }
 
     /// The invoker's guild-level permissions. Free for a slash command —
-    /// Discord includes it directly on the interaction. Costs one API
-    /// call for a prefix command (fetches the guild's roles to compute
-    /// it via `PermissionCalculator`) — acceptable since this only runs
-    /// on a deliberate command invocation, nothing like the per-message
-    /// hot path `gateway.rs`'s scam/spam/invite checks run on.
+    /// Discord includes it directly on the interaction. For a prefix
+    /// command, reads the guild's role-permission table from
+    /// `state.role_cache` instead of Discord directly — the member's own
+    /// role *assignments* are already inline on `message.member`, so the
+    /// only thing that ever needed a network round-trip was the
+    /// role-ID-to-permissions mapping, and that's cached.
     pub async fn invoker_permissions(&self, state: &AppState) -> Permissions {
         match self {
             Self::Interaction(interaction) => interaction
@@ -69,52 +69,29 @@ impl CommandSource<'_> {
                     return Permissions::empty();
                 };
 
-                let Ok(roles_response) = state.http.roles(guild_id).await else {
+                let Some(snapshot) = state.role_cache.get(&state.http, &state.db, guild_id).await
+                else {
                     return Permissions::empty();
                 };
-                let Ok(roles) = roles_response.model().await else {
-                    return Permissions::empty();
-                };
-
-                let everyone_role = roles
-                    .iter()
-                    .find(|role| role.id.get() == guild_id.get())
-                    .map_or_else(Permissions::empty, |role| role.permissions);
 
                 let member_roles: Vec<(Id<RoleMarker>, Permissions)> = member
                     .roles
                     .iter()
                     .filter_map(|role_id| {
-                        roles
-                            .iter()
-                            .find(|role| role.id == *role_id)
-                            .map(|role| (*role_id, role.permissions))
+                        snapshot
+                            .roles
+                            .get(role_id)
+                            .map(|permissions| (*role_id, *permissions))
                     })
                     .collect();
-
-                // Blackwall only knows the owner once `/setup` has run at
-                // least once. A slash command doesn't need this fallback —
-                // Discord computes the invoker's real effective
-                // permissions (owner status included) server-side and
-                // sends it directly on the interaction — but this
-                // hand-rolled prefix-command calculator needs an owner ID
-                // to apply that same rule, so fall back to asking Discord
-                // directly on a guild Blackwall hasn't recorded yet.
-                let owner_id = match models::get_owner_id(&state.db, guild_id).await {
-                    Some(owner_id) => Some(owner_id),
-                    None => match state.http.guild(guild_id).await {
-                        Ok(response) => response.model().await.ok().map(|guild| guild.owner_id),
-                        Err(_) => None,
-                    },
-                };
 
                 let mut calculator = PermissionCalculator::new(
                     guild_id,
                     message.author.id,
-                    everyone_role,
+                    snapshot.everyone_permissions,
                     &member_roles,
                 );
-                if let Some(owner_id) = owner_id {
+                if let Some(owner_id) = snapshot.owner_id {
                     calculator = calculator.owner_id(owner_id);
                 }
 

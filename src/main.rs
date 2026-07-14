@@ -51,6 +51,12 @@ async fn main() {
         .await
         .expect("failed to register slash commands with Discord");
 
+    // PgPool is cheap to clone (it's a handle over an internally-shared
+    // connection pool) — the background writer gets its own handle rather
+    // than borrowing AppState's, since it outlives any single request.
+    let (verification_events_tx, verification_events_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(verification::events::run(db.clone(), verification_events_rx));
+
     let state = Arc::new(AppState {
         http,
         application_id,
@@ -61,6 +67,9 @@ async fn main() {
         nuke_tracker: moderation::nuke::NukeTracker::new(),
         evasion_tracker: moderation::evasion::EvasionTracker::new(),
         settings_cache: storage::cache::SettingsCache::new(),
+        role_cache: storage::role_cache::RoleCache::new(),
+        bot_add_gate: moderation::bot_add_gate::BotAddGate::new(),
+        verification_events: verification_events_tx,
         oauth_client,
         sessions: verification::sessions::SessionStore::default(),
         dashboard_sessions: verification::dashboard::DashboardSessionStore::default(),

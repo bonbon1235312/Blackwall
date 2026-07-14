@@ -420,11 +420,22 @@ pub fn manual_moderation_action(
 
 /// Builds the log embed sent when the trusted-role bot-add gate reacts to
 /// a bot/app added by someone without the configured trusted role.
-pub fn unauthorized_bot_add(actor_id: Id<UserMarker>, bot_kicked: bool, roles_removed: usize) -> Embed {
+pub fn unauthorized_bot_add(
+    actor_id: Option<Id<UserMarker>>,
+    bot_id: Id<UserMarker>,
+    bot_kicked: bool,
+    roles_removed: usize,
+) -> Embed {
+    let added_by = match actor_id {
+        Some(actor_id) => format!("<@{actor_id}>"),
+        None => "unknown — audit log did not attribute this in time".to_string(),
+    };
+
     EmbedBuilder::new()
         .title("Unauthorized bot add")
         .color(COLOR_DANGER)
-        .field(EmbedFieldBuilder::new("Added by", format!("<@{actor_id}>")).inline())
+        .field(EmbedFieldBuilder::new("Bot", format!("<@{bot_id}>")).inline())
+        .field(EmbedFieldBuilder::new("Added by", added_by).inline())
         .field(
             EmbedFieldBuilder::new(
                 "Response",

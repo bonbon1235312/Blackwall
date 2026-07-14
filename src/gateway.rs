@@ -11,6 +11,7 @@ use twilight_model::id::Id;
 use crate::actions;
 use crate::actions::lockdown;
 use crate::discord::{embeds, interactions, prefix};
+use crate::moderation::bot_add_gate;
 use crate::moderation::invite;
 use crate::moderation::nuke::NukeViolation;
 use crate::moderation::permissions;
@@ -66,7 +67,12 @@ pub async fn run(token: String, state: Arc<AppState>) {
         | EventTypeFlags::MESSAGE_CREATE
         | EventTypeFlags::MEMBER_ADD
         | EventTypeFlags::GUILD_AUDIT_LOG_ENTRY_CREATE
-        | EventTypeFlags::INTERACTION_CREATE;
+        | EventTypeFlags::INTERACTION_CREATE
+        // Keeps `state.role_cache` (permission checks for prefix commands)
+        // fresh without a re-fetch on every read — see `storage::role_cache`.
+        | EventTypeFlags::ROLE_CREATE
+        | EventTypeFlags::ROLE_UPDATE
+        | EventTypeFlags::ROLE_DELETE;
 
     tracing::info!("connecting to the Discord gateway...");
 
@@ -178,6 +184,16 @@ async fn handle_event(event: Event, state: Arc<AppState>) {
         Event::MemberAdd(member_add) => {
             let guild_id = member_add.guild_id;
 
+            // A bot/app joining isn't a human raid-join candidate — feeding
+            // it into the raid detector below would let a burst of bot
+            // installs (or a single unauthorized one) inflate the join-burst
+            // counters. Route it to the bot-add gate instead, which has its
+            // own dedicated response.
+            if member_add.member.user.bot {
+                handle_bot_member_add(&state, guild_id, member_add.member.user.id);
+                return;
+            }
+
             let settings = state.settings_cache.get(&state.db, guild_id).await;
             if !settings.anti_raid_enabled {
                 return;
@@ -275,7 +291,7 @@ async fn handle_event(event: Event, state: Arc<AppState>) {
             // in 30 seconds. BotAdd still also counts toward that burst
             // either way — this doesn't replace it.
             if entry.action_type == AuditLogEventType::BotAdd {
-                handle_unauthorized_bot_add(&state, guild_id, actor_id, entry.target_id).await;
+                handle_bot_add_audit_entry(&state, guild_id, actor_id, entry.target_id);
             }
 
             if let Some(violation) = state.nuke_tracker.record(
@@ -290,7 +306,68 @@ async fn handle_event(event: Event, state: Arc<AppState>) {
         Event::InteractionCreate(interaction) => {
             interactions::handle(interaction.0, &state).await;
         }
+        Event::RoleCreate(e) => state.role_cache.invalidate(e.guild_id),
+        Event::RoleUpdate(e) => state.role_cache.invalidate(e.guild_id),
+        Event::RoleDelete(e) => state.role_cache.invalidate(e.guild_id),
         _ => {}
+    }
+}
+
+/// Resolves the `MemberAdd` side of the bot-add-gate race (see
+/// `moderation::bot_add_gate`) for a bot/app that just joined `guild_id`.
+fn handle_bot_member_add(state: &Arc<AppState>, guild_id: Id<GuildMarker>, bot_id: Id<UserMarker>) {
+    match state.bot_add_gate.member_seen(guild_id, bot_id) {
+        bot_add_gate::MemberSeenOutcome::ActorKnown(actor_id) => {
+            let state = Arc::clone(state);
+            tokio::spawn(async move {
+                evaluate_bot_add_gate(&state, guild_id, bot_id, Some(actor_id)).await;
+            });
+        }
+        bot_add_gate::MemberSeenOutcome::AwaitAuditLog => {
+            let state = Arc::clone(state);
+            tokio::spawn(async move {
+                tokio::time::sleep(bot_add_gate::AUDIT_LOG_GRACE).await;
+                if state.bot_add_gate.take_if_still_pending(guild_id, bot_id) {
+                    // The audit-log entry never arrived in time — default
+                    // to unattributed-and-unauthorized rather than trust
+                    // silence indefinitely.
+                    evaluate_bot_add_gate(&state, guild_id, bot_id, None).await;
+                }
+            });
+        }
+    }
+}
+
+/// Resolves the `GuildAuditLogEntryCreate(BotAdd)` side of the same race.
+/// `target_id` is documented as always present for this action type, but
+/// never trust that blindly — a missing target means Blackwall has no bot
+/// ID to key the gate on, so there's nothing to do but log it.
+fn handle_bot_add_audit_entry(
+    state: &Arc<AppState>,
+    guild_id: Id<GuildMarker>,
+    actor_id: Id<UserMarker>,
+    target_id: Option<Id<twilight_model::id::marker::GenericMarker>>,
+) {
+    let Some(target_id) = target_id else {
+        tracing::warn!(%guild_id, "BotAdd audit-log entry had no target_id, could not resolve the bot-add gate");
+        return;
+    };
+    let bot_id = target_id.cast::<UserMarker>();
+
+    if state.bot_add_gate.actor_known(guild_id, bot_id, actor_id) {
+        let state = Arc::clone(state);
+        tokio::spawn(async move {
+            evaluate_bot_add_gate(&state, guild_id, bot_id, Some(actor_id)).await;
+        });
+    } else {
+        // Stashed for `MemberAdd` to pick up — but schedule a cleanup in
+        // case it never arrives (e.g. the bot left again immediately), so
+        // this doesn't sit in the map forever.
+        let state = Arc::clone(state);
+        tokio::spawn(async move {
+            tokio::time::sleep(bot_add_gate::AUDIT_LOG_GRACE).await;
+            state.bot_add_gate.discard(guild_id, bot_id);
+        });
     }
 }
 
@@ -879,87 +956,99 @@ async fn strip_dangerous_roles(
     roles_removed
 }
 
-/// Reacts when a bot/app is added to the server by someone who doesn't
-/// hold the guild's configured trusted role: kicks the newly-added bot and
-/// strips the adding actor's dangerous roles, the same severity as a
-/// confirmed nuke attempt. A guild with no trusted role configured yet has
-/// no one to exempt, so this is a no-op there — BotAdd still counts toward
-/// the generic nuke-burst threshold either way (see the caller).
-async fn handle_unauthorized_bot_add(
+/// Reacts once the bot-add gate (see `moderation::bot_add_gate`) has
+/// resolved — either with a confirmed actor (from the `BotAdd` audit-log
+/// entry, however it arrived relative to `MemberAdd`) or with `None` (the
+/// audit-log entry never arrived within `AUDIT_LOG_GRACE`, so there's no
+/// one to attribute this to). A guild with no trusted role configured yet
+/// has no one to exempt, so this is a no-op there — `BotAdd` still counts
+/// toward the generic nuke-burst threshold either way (see the caller).
+async fn evaluate_bot_add_gate(
     state: &AppState,
     guild_id: Id<GuildMarker>,
-    actor_id: Id<UserMarker>,
-    target_id: Option<Id<twilight_model::id::marker::GenericMarker>>,
+    bot_id: Id<UserMarker>,
+    actor_id: Option<Id<UserMarker>>,
 ) {
     let Some(trusted_role_id) = models::get_trusted_role_id(&state.db, guild_id).await else {
         return;
     };
 
-    let owner_id = models::get_owner_id(&state.db, guild_id).await;
-    if owner_id == Some(actor_id) {
-        return;
-    }
-
-    let has_trusted_role = match state.http.guild_member(guild_id, actor_id).await {
-        Ok(response) => match response.model().await {
-            Ok(member) => member.roles.contains(&trusted_role_id),
-            Err(source) => {
-                tracing::error!(?source, %guild_id, %actor_id, "failed to decode member while checking the trusted role");
-                return;
-            }
-        },
-        Err(source) => {
-            tracing::error!(?source, %guild_id, %actor_id, "failed to look up member while checking the trusted role");
+    if let Some(actor_id) = actor_id {
+        let owner_id = models::get_owner_id(&state.db, guild_id).await;
+        if owner_id == Some(actor_id) {
             return;
         }
-    };
 
-    if has_trusted_role {
-        return;
+        let has_trusted_role = match state.http.guild_member(guild_id, actor_id).await {
+            Ok(response) => match response.model().await {
+                Ok(member) => member.roles.contains(&trusted_role_id),
+                Err(source) => {
+                    tracing::error!(?source, %guild_id, %actor_id, "failed to decode member while checking the trusted role");
+                    return;
+                }
+            },
+            Err(source) => {
+                tracing::error!(?source, %guild_id, %actor_id, "failed to look up member while checking the trusted role");
+                return;
+            }
+        };
+
+        if has_trusted_role {
+            return;
+        }
     }
 
-    let bot_kicked = match target_id {
-        Some(target_id) => {
-            let bot_user_id = target_id.cast::<UserMarker>();
-            match state.http.remove_guild_member(guild_id, bot_user_id).await {
-                Ok(_) => true,
-                Err(source) => {
-                    tracing::error!(?source, %guild_id, %bot_user_id, "failed to kick unauthorized bot");
-                    false
-                }
-            }
-        }
-        None => {
-            tracing::warn!(%guild_id, "BotAdd audit-log entry had no target_id, could not kick the bot");
+    let bot_kicked = match state.http.remove_guild_member(guild_id, bot_id).await {
+        Ok(_) => true,
+        Err(source) => {
+            tracing::error!(?source, %guild_id, %bot_id, "failed to kick unauthorized bot");
             false
         }
     };
 
-    let roles_removed = strip_dangerous_roles(state, guild_id, actor_id).await;
+    // No attributed actor means no one to strip roles from — the rarer,
+    // more suspicious case (see the security-event label below), not the
+    // same thing as a resolved-but-untrusted actor.
+    let roles_removed = match actor_id {
+        Some(actor_id) => strip_dangerous_roles(state, guild_id, actor_id).await,
+        None => 0,
+    };
 
     tracing::warn!(
         %guild_id,
-        %actor_id,
+        ?actor_id,
+        %bot_id,
         bot_kicked,
         roles_removed,
-        "unauthorized bot add: actor did not hold the trusted role"
+        "unauthorized bot add"
     );
 
-    let description = format!(
-        "<@{actor_id}> added a bot/app without holding this server's trusted role. Bot removed: \
-        {}. Stripped {roles_removed} dangerous role(s) from <@{actor_id}>.",
-        if bot_kicked { "yes" } else { "no — check the bot's Kick Members permission" }
-    );
+    let kicked_text = if bot_kicked {
+        "yes"
+    } else {
+        "no — check the bot's Kick Members permission"
+    };
 
-    if let Err(source) = models::record_security_event(
-        &state.db,
-        guild_id,
-        Some(actor_id),
-        "unauthorized_bot_add",
-        "critical",
-        &description,
-    )
-    .await
+    let (event_type, description) = match actor_id {
+        Some(actor_id) => (
+            "unauthorized_bot_add",
+            format!(
+                "<@{actor_id}> added <@{bot_id}> without holding this server's trusted role. \
+                Bot removed: {kicked_text}. Stripped {roles_removed} dangerous role(s) from <@{actor_id}>."
+            ),
+        ),
+        None => (
+            "unattributed_bot_add",
+            format!(
+                "<@{bot_id}> was added, but Discord's audit log did not attribute who added it \
+                within {}s. Bot removed: {kicked_text}.",
+                bot_add_gate::AUDIT_LOG_GRACE.as_secs(),
+            ),
+        ),
+    };
+
+    if let Err(source) =
+        models::record_security_event(&state.db, guild_id, actor_id, event_type, "critical", &description).await
     {
         tracing::error!(?source, %guild_id, "failed to record unauthorized-bot-add security event");
     }
@@ -968,7 +1057,7 @@ async fn handle_unauthorized_bot_add(
         return;
     };
 
-    let embed = embeds::unauthorized_bot_add(actor_id, bot_kicked, roles_removed);
+    let embed = embeds::unauthorized_bot_add(actor_id, bot_id, bot_kicked, roles_removed);
 
     if let Err(source) = state
         .http
